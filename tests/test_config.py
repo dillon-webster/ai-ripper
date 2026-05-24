@@ -35,7 +35,8 @@ def test_load_config_raises_on_missing_key():
         "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/test",
         "TEMP_DIR": "/tmp/ai-ripper",
     }
-    with patch.dict(os.environ, env, clear=True):
+    with patch.dict(os.environ, env, clear=True), \
+         patch("config.load_dotenv"):  # prevent real .env from overriding test env
         with pytest.raises(ValueError, match="SERVER_IP"):
             from config import load_config
             load_config()

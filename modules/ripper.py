@@ -83,7 +83,8 @@ def rip(volume_path: Path, temp_dir: Path) -> List[Dict]:
         info = title_info.get(idx, {})
         duration_secs = info.get("duration_secs", 0)
 
-        if duration_secs < MIN_TITLE_DURATION_SECS:
+        # Only filter if we actually got duration data — 0 means info failed, include it
+        if duration_secs > 0 and duration_secs < MIN_TITLE_DURATION_SECS:
             log.info(f"Skipping {mkv.name} (duration {duration_secs}s < {MIN_TITLE_DURATION_SECS}s)")
             continue
 
