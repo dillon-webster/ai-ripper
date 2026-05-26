@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Ripper — automatic DVD/Blu-ray ripper
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__WORKING_DIR__
+ExecStart=__PYTHON__ __RIPPER_PATH__
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:__LOG_PATH__
+StandardError=append:__LOG_PATH__
+
+[Install]
+WantedBy=default.target

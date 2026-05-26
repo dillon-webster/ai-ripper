@@ -26,9 +26,14 @@ def cleanup_temp(temp_dir: Path) -> None:
 
 
 def eject_disc(volume_path: Path) -> None:
-    """Eject the disc using drutil."""
+    """Eject the disc. Uses drutil on macOS, eject on Linux."""
+    import platform
     import subprocess
-    subprocess.run(["drutil", "eject"], check=False)
+    if platform.system() == "Darwin":
+        subprocess.run(["drutil", "eject"], check=False)
+    else:
+        # On Linux, eject by device path or volume path
+        subprocess.run(["eject", str(volume_path)], check=False)
     log.info("Disc ejected")
 
 
