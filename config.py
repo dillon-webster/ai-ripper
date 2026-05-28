@@ -14,6 +14,7 @@ class Config:
     jellyfin_api_key: str
     discord_webhook_url: str
     temp_dir: Path
+    media_root: str
 
 
 def load_config() -> Config:
@@ -27,6 +28,7 @@ def load_config() -> Config:
         "JELLYFIN_API_KEY",
         "DISCORD_WEBHOOK_URL",
         "TEMP_DIR",
+        "MEDIA_ROOT",
     ]
     missing = [k for k in required if not os.getenv(k)]
     if missing:
@@ -40,4 +42,5 @@ def load_config() -> Config:
         jellyfin_api_key=os.environ["JELLYFIN_API_KEY"],
         discord_webhook_url=os.environ["DISCORD_WEBHOOK_URL"],
         temp_dir=Path(os.environ["TEMP_DIR"]),
+        media_root=os.environ["MEDIA_ROOT"],
     )

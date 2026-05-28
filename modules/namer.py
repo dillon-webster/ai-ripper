@@ -21,7 +21,7 @@ def _duration_hms(secs: int) -> str:
     return f"{h}:{m:02d}:{s:02d}"
 
 
-def _build_prompt(volume_name: str, titles: List[Dict]) -> str:
+def _build_prompt(volume_name: str, titles: List[Dict], existing_episodes: List[str] = None) -> str:
     title_list = [
         {
             "index": t["title_index"],
@@ -30,13 +30,29 @@ def _build_prompt(volume_name: str, titles: List[Dict]) -> str:
         }
         for t in titles
     ]
+    existing_section = ""
+    if existing_episodes:
+        existing_section = (
+            f"\nEpisodes already on the server (do not reuse these episode numbers):\n"
+            + "\n".join(f"  {e}" for e in existing_episodes)
+            + "\n"
+        )
+
     return f"""You are identifying content from a DVD/Blu-ray disc for Jellyfin media server organization.
 
 Disc volume label: {volume_name}
 Titles on disc:
 {json.dumps(title_list, indent=2)}
+{existing_section}
 
 For each title, determine what movie or TV show episode it contains and return the correct Jellyfin-compatible filename.
+
+IMPORTANT for multi-disc TV sets: The disc volume label often encodes the disc number (e.g. D2, DISC2, DISK2, _2 at the end).
+Episodes are numbered continuously across discs — disc 2 does NOT restart at E01. Use the disc number to infer
+the correct starting episode number for this disc.
+
+IMPORTANT for episode ordering: Titles are listed in disc playback order. The title with the lowest index is the
+first episode on this disc. Assign episode numbers sequentially in ascending index order — do NOT reorder them.
 
 Return ONLY a valid JSON array with no other text, markdown, or explanation:
 [
@@ -53,14 +69,14 @@ Jellyfin filename conventions:
 - Movies: Movie.Name.2023.mkv (include year if known, use dots not spaces)"""
 
 
-def identify(volume_name: str, titles: List[Dict], api_key: str) -> List[Dict]:
+def identify(volume_name: str, titles: List[Dict], api_key: str, existing_episodes: List[str] = None) -> List[Dict]:
     """
     Call Anthropic API to identify titles and generate Jellyfin-compatible filenames.
     Returns original title dicts merged with naming fields.
     Raises NamerError if JSON parsing fails after one retry.
     """
     client = anthropic.Anthropic(api_key=api_key)
-    prompt = _build_prompt(volume_name, titles)
+    prompt = _build_prompt(volume_name, titles, existing_episodes)
 
     messages = [{"role": "user", "content": prompt}]
 

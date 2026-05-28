@@ -49,7 +49,8 @@ def main() -> None:
             titles = disc_ripper.rip(volume_path, config.temp_dir)
             log.info(f"Ripped {len(titles)} title(s)")
 
-            named = namer.identify(volume_name, titles, config.anthropic_api_key)
+            existing = transfer.list_existing_episodes(config)
+            named = namer.identify(volume_name, titles, config.anthropic_api_key, existing_episodes=existing)
             log.info(f"Named {len(named)} title(s)")
 
             transfer.send_all(named, config)

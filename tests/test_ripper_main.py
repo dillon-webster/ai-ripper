@@ -13,6 +13,7 @@ def _make_config(tmp_path):
         jellyfin_api_key="jf-key",
         discord_webhook_url="https://discord.com/api/webhooks/test",
         temp_dir=tmp_path / "temp",
+        media_root="/media",
     )
 
 

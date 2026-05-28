@@ -29,6 +29,9 @@ def _with_retry(fn, delays: List[int], label: str) -> None:
         try:
             fn()
             return
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            log.warning(f"{label} attempt {attempt + 1} failed: HTTP {e.code} {e.reason} — {body}")
         except urllib.error.URLError as e:
             log.warning(f"{label} attempt {attempt + 1} failed: {e}")
     log.warning(f"{label} failed after {len(delays) + 1} attempts — continuing")
@@ -59,7 +62,10 @@ def send_discord(titles: List[str], success: bool, config, error: str = "") -> N
     def do():
         _post(
             config.discord_webhook_url,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "ai-ripper/1.0",
+            },
             body=payload,
         )
 

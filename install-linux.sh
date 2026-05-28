@@ -23,6 +23,9 @@ sed \
     -e "s|__LOG_PATH__|$LOG_PATH|g" \
     "$SCRIPT_DIR/ai-ripper.service" > "$SERVICE_DEST"
 
+# Enable linger so the user service survives logout (required for headless/server use)
+loginctl enable-linger "$USER"
+
 # Reload systemd and enable/start the service
 systemctl --user daemon-reload
 systemctl --user enable --now ai-ripper.service

@@ -12,6 +12,7 @@ def test_load_config_returns_config_with_all_fields():
         "JELLYFIN_API_KEY": "jellyfin-key",
         "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/test",
         "TEMP_DIR": "/tmp/ai-ripper",
+        "MEDIA_ROOT": "/media",
     }
     with patch.dict(os.environ, env, clear=True):
         from config import load_config
@@ -23,6 +24,7 @@ def test_load_config_returns_config_with_all_fields():
     assert config.jellyfin_api_key == "jellyfin-key"
     assert config.discord_webhook_url == "https://discord.com/api/webhooks/test"
     assert str(config.temp_dir) == "/tmp/ai-ripper"
+    assert config.media_root == "/media"
 
 
 def test_load_config_raises_on_missing_key():

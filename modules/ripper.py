@@ -40,8 +40,8 @@ def _parse_info(output: str) -> Dict[int, Dict]:
 
 
 def _parse_title_index(filename: str) -> int:
-    """Extract title index from MakeMKV output name like 'title_t03.mkv'."""
-    m = re.search(r"title_t(\d+)", filename)
+    """Extract title index from MakeMKV output name like 'title_t03.mkv' or 'DISC NAME_t03.mkv'."""
+    m = re.search(r"_t(\d+)", filename)
     return int(m.group(1)) if m else -1
 
 
