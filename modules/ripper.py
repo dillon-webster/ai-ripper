@@ -7,6 +7,7 @@ from typing import Dict, List
 log = logging.getLogger(__name__)
 
 MIN_TITLE_DURATION_SECS = 300  # 5 minutes — skip extras/menus
+PLAY_ALL_TOLERANCE = 0.10  # title within 10% of sum of others is "Play All"
 
 
 class RipError(Exception):
@@ -47,9 +48,10 @@ def _parse_title_index(filename: str) -> int:
 
 def rip(volume_path: Path, temp_dir: Path) -> List[Dict]:
     """
-    Rip all titles from the disc to temp_dir.
+    Rip eligible titles from the disc to temp_dir.
     Returns list of dicts: [{path, duration_secs, title_index}].
-    Titles shorter than MIN_TITLE_DURATION_SECS are excluded.
+    Titles outside [MIN, MAX] duration range are excluded BEFORE ripping
+    (skips menus/extras and TV "Play All" combined titles).
     Raises RipError on failure.
     """
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -63,38 +65,57 @@ def rip(volume_path: Path, temp_dir: Path) -> List[Dict]:
     )
     title_info = _parse_info(info_result.stdout)
 
-    # Phase 2: rip all titles
-    log.info(f"Ripping disc to {temp_dir}...")
-    rip_result = subprocess.run(
-        ["makemkvcon", "mkv", "disc:0", "all", str(temp_dir)],
-        check=False,
-    )
-    if rip_result.returncode != 0:
-        raise RipError(f"makemkvcon exited with exit code {rip_result.returncode}")
+    # Filter titles by minimum duration (drop menus/extras)
+    eligible_indices = []
+    for idx, info in sorted(title_info.items()):
+        dur = info.get("duration_secs", 0)
+        if dur == 0:
+            log.info(f"Title #{idx}: unknown duration, including anyway")
+            eligible_indices.append(idx)
+        elif dur < MIN_TITLE_DURATION_SECS:
+            log.info(f"Skipping title #{idx} (duration {dur}s < {MIN_TITLE_DURATION_SECS}s — extra/menu)")
+        else:
+            eligible_indices.append(idx)
+
+    # Detect "Play All": if the longest title ≈ sum of the others, drop it
+    if len(eligible_indices) >= 3:
+        durations = [(idx, title_info[idx].get("duration_secs", 0)) for idx in eligible_indices]
+        longest_idx, longest_dur = max(durations, key=lambda x: x[1])
+        others_sum = sum(d for idx, d in durations if idx != longest_idx)
+        if others_sum > 0 and abs(longest_dur - others_sum) / others_sum <= PLAY_ALL_TOLERANCE:
+            log.info(f"Skipping title #{longest_idx} (duration {longest_dur}s ≈ sum of others {others_sum}s — 'Play All')")
+            eligible_indices.remove(longest_idx)
+
+    if not eligible_indices:
+        raise RipError("No eligible titles found on disc after duration filtering")
+
+    # Phase 2: rip eligible titles one at a time
+    log.info(f"Ripping {len(eligible_indices)} title(s) to {temp_dir}...")
+    for idx in eligible_indices:
+        log.info(f"Ripping title #{idx}...")
+        rip_result = subprocess.run(
+            ["makemkvcon", "mkv", "disc:0", str(idx), str(temp_dir)],
+            check=False,
+        )
+        if rip_result.returncode != 0:
+            raise RipError(f"makemkvcon exited with code {rip_result.returncode} on title #{idx}")
 
     mkv_files = sorted(temp_dir.glob("*.mkv"))
     if not mkv_files:
         raise RipError("No MKV files produced by makemkvcon")
 
-    # Match output files to title info by index parsed from filename
+    # Match output files to title info, only including eligible titles
+    eligible_set = set(eligible_indices)
     output = []
     for mkv in mkv_files:
         idx = _parse_title_index(mkv.name)
-        info = title_info.get(idx, {})
-        duration_secs = info.get("duration_secs", 0)
-
-        # Only filter if we actually got duration data — 0 means info failed, include it
-        if duration_secs > 0 and duration_secs < MIN_TITLE_DURATION_SECS:
-            log.info(f"Skipping {mkv.name} (duration {duration_secs}s < {MIN_TITLE_DURATION_SECS}s)")
+        if idx not in eligible_set:
             continue
-
+        info = title_info.get(idx, {})
         output.append({
             "path": mkv,
-            "duration_secs": duration_secs,
+            "duration_secs": info.get("duration_secs", 0),
             "title_index": idx,
         })
-
-    if not output:
-        raise RipError("No valid titles found after filtering short titles")
 
     return output

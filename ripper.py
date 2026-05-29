@@ -50,7 +50,8 @@ def main() -> None:
             log.info(f"Ripped {len(titles)} title(s)")
 
             existing = transfer.list_existing_episodes(config)
-            named = namer.identify(volume_name, titles, config.anthropic_api_key, existing_episodes=existing)
+            titles_ordered = sorted(titles, key=lambda t: t["title_index"], reverse=True)
+            named = namer.identify(volume_name, titles_ordered, config.anthropic_api_key, existing_episodes=existing)
             log.info(f"Named {len(named)} title(s)")
 
             transfer.send_all(named, config)

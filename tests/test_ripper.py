@@ -60,17 +60,20 @@ def test_rip_returns_titles_with_duration(tmp_path):
 
 
 def test_rip_raises_on_makemkv_failure(tmp_path):
+    # Info reports one eligible title, but the actual rip command fails
+    info_output = 'TINFO:0,9,0,"1:42:07"\n'
+
     def fake_run(cmd, **kwargs):
         mock = MagicMock()
         if "info" in cmd:
             mock.returncode = 0
-            mock.stdout = ""
+            mock.stdout = info_output
         else:
             mock.returncode = 1
         return mock
 
     with patch("modules.ripper.subprocess.run", side_effect=fake_run):
-        with pytest.raises(RipError, match="exit code 1"):
+        with pytest.raises(RipError, match="exited with code 1"):
             rip(Path("/Volumes/FAKE_DISC"), tmp_path)
 
 

@@ -2,7 +2,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 from config import Config
-from modules.transfer import send_all, TransferError, _remote_subpath
+from modules.transfer import send_all, TransferError, _remote_subpath, _remote_file_exists
 
 
 def _make_config():
@@ -51,6 +51,7 @@ def test_send_all_transfers_to_correct_path(tmp_path):
     config = _make_config()
 
     with patch("modules.transfer._ssh_mkdir") as mock_mkdir, \
+         patch("modules.transfer._remote_file_exists", return_value=False), \
          patch("modules.transfer._scp") as mock_scp:
         result = send_all(titles, config)
 
@@ -74,6 +75,7 @@ def test_send_all_retries_on_scp_failure(tmp_path):
             raise TransferError("Connection refused")
 
     with patch("modules.transfer._ssh_mkdir"), \
+         patch("modules.transfer._remote_file_exists", return_value=False), \
          patch("modules.transfer._scp", side_effect=fake_scp), \
          patch("modules.transfer.time.sleep"):
         result = send_all(titles, config)
@@ -87,6 +89,7 @@ def test_send_all_raises_after_all_retries_fail(tmp_path):
     config = _make_config()
 
     with patch("modules.transfer._ssh_mkdir"), \
+         patch("modules.transfer._remote_file_exists", return_value=False), \
          patch("modules.transfer._scp", side_effect=TransferError("Connection refused")), \
          patch("modules.transfer.time.sleep"):
         with pytest.raises(TransferError, match="Friends.S01E01.mkv"):

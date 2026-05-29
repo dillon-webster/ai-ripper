@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List
 
@@ -33,8 +34,8 @@ def _build_prompt(volume_name: str, titles: List[Dict], existing_episodes: List[
     existing_section = ""
     if existing_episodes:
         existing_section = (
-            f"\nEpisodes already on the server (do not reuse these episode numbers):\n"
-            + "\n".join(f"  {e}" for e in existing_episodes)
+            "\nFiles already on the server:\n"
+            + "\n".join(f"  {e}" for e in sorted(existing_episodes))
             + "\n"
         )
 
@@ -47,12 +48,15 @@ Titles on disc:
 
 For each title, determine what movie or TV show episode it contains and return the correct Jellyfin-compatible filename.
 
-IMPORTANT for multi-disc TV sets: The disc volume label often encodes the disc number (e.g. D2, DISC2, DISK2, _2 at the end).
-Episodes are numbered continuously across discs — disc 2 does NOT restart at E01. Use the disc number to infer
-the correct starting episode number for this disc.
+IMPORTANT for multi-disc TV sets:
+- The disc volume label encodes the show, season, and disc number (e.g. "FRIENDS SEASON 2-A1" means Friends Season 2 Disc 1).
+- Look at the existing files on the server to determine the correct starting episode number for this disc:
+  - If this disc's show/season already has episodes on the server, continue numbering from the next one (e.g. if S01E12 exists, start at S01E13).
+  - If this disc is a new season that has no episodes yet, start at E01 of that season (e.g. if only S01 exists and this disc is Season 2, start at S02E01).
+- Never reuse an episode number that already exists in the server file list above.
 
-IMPORTANT for episode ordering: Titles are listed in disc playback order. The title with the lowest index is the
-first episode on this disc. Assign episode numbers sequentially in ascending index order — do NOT reorder them.
+IMPORTANT for episode ordering: Titles are listed in disc playback order (first episode first). Assign episode
+numbers sequentially in the order they are presented — do NOT reorder them.
 
 Return ONLY a valid JSON array with no other text, markdown, or explanation:
 [
@@ -67,6 +71,12 @@ Return ONLY a valid JSON array with no other text, markdown, or explanation:
 Jellyfin filename conventions:
 - TV shows: Show.Name.S01E01.mkv (use dots not spaces, season+episode zero-padded)
 - Movies: Movie.Name.2023.mkv (include year if known, use dots not spaces)"""
+
+
+def _strip_fences(text: str) -> str:
+    """Remove markdown code fences (```json ... ``` or ``` ... ```) if present."""
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    return m.group(1) if m else text
 
 
 def identify(volume_name: str, titles: List[Dict], api_key: str, existing_episodes: List[str] = None) -> List[Dict]:
@@ -89,7 +99,7 @@ def identify(volume_name: str, titles: List[Dict], api_key: str, existing_episod
 
     naming_data = None
     try:
-        naming_data = json.loads(raw)
+        naming_data = json.loads(_strip_fences(raw))
     except json.JSONDecodeError:
         log.warning("Malformed JSON from Anthropic; retrying with correction prompt")
         messages.append({"role": "assistant", "content": raw})
@@ -104,7 +114,7 @@ def identify(volume_name: str, titles: List[Dict], api_key: str, existing_episod
         )
         raw2 = retry_response.content[0].text.strip()
         try:
-            naming_data = json.loads(raw2)
+            naming_data = json.loads(_strip_fences(raw2))
         except json.JSONDecodeError as e:
             raise NamerError(f"Failed to parse naming response after retry: {e}") from e
 

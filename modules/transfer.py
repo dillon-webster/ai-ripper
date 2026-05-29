@@ -45,6 +45,15 @@ def _ssh_mkdir(remote_dir: str, config) -> None:
         raise TransferError(f"mkdir failed: {result.stderr.strip()}")
 
 
+def _remote_file_exists(remote_file: str, config) -> bool:
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, f"{config.server_user}@{config.server_ip}",
+         f"test -f {shlex.quote(remote_file)}"],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
 def _scp(local_path: Path, remote: str) -> None:
     result = subprocess.run(
         ["scp", *SSH_OPTS, str(local_path), remote],
@@ -59,7 +68,7 @@ def list_existing_episodes(config) -> List[str]:
     """Return sorted list of existing episode filenames on the server (e.g. 'Friends.S01E01.mkv')."""
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"{config.server_user}@{config.server_ip}",
-         f"find {shlex.quote(config.media_root)}/tvshows -name '*.mkv' | sort"],
+         f"find -L {shlex.quote(config.media_root)}/tvshows -name '*.mkv' | sort"],
         capture_output=True,
         text=True,
     )
@@ -92,6 +101,8 @@ def send_all(named_titles: List[Dict], config) -> List[str]:
                 time.sleep(delay)
             try:
                 _ssh_mkdir(remote_dir, config)
+                if _remote_file_exists(remote_file, config):
+                    raise TransferError(f"{filename} already exists on server — refusing to overwrite")
                 _scp(title["path"], remote)
                 remote_paths.append(remote)
                 log.info(f"Transferred: {filename} → {remote}")
