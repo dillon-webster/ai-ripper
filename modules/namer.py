@@ -59,6 +59,16 @@ IMPORTANT for multi-disc TV sets:
 IMPORTANT for episode ordering: Titles are listed in disc playback order (first episode first). Assign episode
 numbers sequentially in the order they are presented — do NOT reorder them.
 
+IMPORTANT for double-length / two-part episodes:
+- A single title whose duration is roughly DOUBLE the typical episode length on this disc (e.g. ~44+ min when the
+  other episodes run ~22 min) is almost always a special that aired as one feature-length episode but that episode
+  databases (TheTVDB, which Jellyfin matches against) count as TWO consecutive episode numbers (e.g. Friends Season 2
+  "The One After the Super Bowl" is one file but is episodes 12 AND 13).
+- Name that single file with a COMBINED episode range so Jellyfin maps the one file onto both slots:
+  Show.Name.S02E12-E13.mkv (one file, hyphenated range, both numbers zero-padded).
+- Such a title CONSUMES BOTH episode numbers. Continue numbering the following titles after the END of the range
+  (e.g. after S02E12-E13 the next title is S02E14, NOT S02E13). Getting this wrong shifts every later episode.
+
 Return ONLY a valid JSON array with no other text, markdown, or explanation:
 [
   {{
@@ -71,6 +81,7 @@ Return ONLY a valid JSON array with no other text, markdown, or explanation:
 
 Jellyfin filename conventions:
 - TV shows: Show.Name.S01E01.mkv (use dots not spaces, season+episode zero-padded)
+- Double-length episode spanning two numbers: Show.Name.S02E12-E13.mkv (single file, hyphenated range)
 - Movies: Movie.Name.2023.mkv (include year if known, use dots not spaces)"""
 
 

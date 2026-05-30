@@ -47,6 +47,43 @@ def test_identify_returns_named_titles(tmp_path):
     assert result[1]["jellyfin_filename"] == "Friends.S01E02.mkv"
 
 
+def test_prompt_instructs_double_length_episode_range():
+    from modules.namer import _build_prompt
+
+    titles = [
+        {"path": Path("title_t00.mkv"), "duration_secs": 2880, "title_index": 0},
+        {"path": Path("title_t01.mkv"), "duration_secs": 1320, "title_index": 1},
+    ]
+    prompt = _build_prompt("FRIENDS SEASON 2-A2", titles)
+
+    # The prompt must teach the model to merge a double-length title into a
+    # hyphenated episode range and to skip the consumed number afterward.
+    assert "S02E12-E13.mkv" in prompt
+    assert "CONSUMES BOTH episode numbers" in prompt
+
+
+def test_identify_accepts_double_length_episode_range(tmp_path):
+    f1 = tmp_path / "title_t00.mkv"
+    f2 = tmp_path / "title_t01.mkv"
+    f1.write_bytes(b"")
+    f2.write_bytes(b"")
+    titles = [
+        {"path": f1, "duration_secs": 2880, "title_index": 0},  # ~48 min double episode
+        {"path": f2, "duration_secs": 1320, "title_index": 1},  # ~22 min normal episode
+    ]
+    api_response = (
+        '[{"index": 0, "jellyfin_filename": "Friends.S02E12-E13.mkv", "media_type": "tv", "destination": "tvshows"},'
+        ' {"index": 1, "jellyfin_filename": "Friends.S02E14.mkv", "media_type": "tv", "destination": "tvshows"}]'
+    )
+    mock_client = _mock_anthropic_response(api_response)
+
+    with patch("modules.namer.anthropic.Anthropic", return_value=mock_client):
+        result = identify("FRIENDS SEASON 2-A2", titles, "sk-ant-test")
+
+    assert result[0]["jellyfin_filename"] == "Friends.S02E12-E13.mkv"
+    assert result[1]["jellyfin_filename"] == "Friends.S02E14.mkv"
+
+
 def test_identify_retries_on_malformed_json(tmp_path):
     titles = _make_titles(tmp_path)
     bad_response = "Here is the JSON: [invalid json"
