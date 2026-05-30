@@ -46,11 +46,8 @@ def main() -> None:
         log.info(f"Disc detected: {volume_name} at {volume_path}")
 
         try:
-            existing_with_dur = transfer.list_existing_episodes_with_duration(config)
-            existing = [name for name, _ in existing_with_dur]
-            existing_durations = [d for _, d in existing_with_dur]
-
-            titles = disc_ripper.rip(volume_path, config.temp_dir, existing_durations=existing_durations)
+            prior_durations = transfer.load_disc_history_durations(volume_name, config)
+            titles = disc_ripper.rip(volume_path, config.temp_dir, existing_durations=prior_durations)
             log.info(f"Ripped {len(titles)} title(s)")
 
             if not titles:
@@ -58,12 +55,15 @@ def main() -> None:
                 notifier.send_discord([], success=True, config=config)
                 continue
 
+            existing = transfer.list_existing_episodes(config)
             titles_ordered = sorted(titles, key=lambda t: t["title_index"], reverse=True)
             named = namer.identify(volume_name, titles_ordered, config.anthropic_api_key, existing_episodes=existing)
             log.info(f"Named {len(named)} title(s)")
 
             transfer.send_all(named, config)
             log.info("Transfer complete")
+
+            transfer.record_disc_history(volume_name, named, config)
 
             notifier.trigger_jellyfin_scan(config)
             notifier.send_discord(
