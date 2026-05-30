@@ -46,10 +46,18 @@ def main() -> None:
         log.info(f"Disc detected: {volume_name} at {volume_path}")
 
         try:
-            titles = disc_ripper.rip(volume_path, config.temp_dir)
+            existing_with_dur = transfer.list_existing_episodes_with_duration(config)
+            existing = [name for name, _ in existing_with_dur]
+            existing_durations = [d for _, d in existing_with_dur]
+
+            titles = disc_ripper.rip(volume_path, config.temp_dir, existing_durations=existing_durations)
             log.info(f"Ripped {len(titles)} title(s)")
 
-            existing = transfer.list_existing_episodes(config)
+            if not titles:
+                log.info("Nothing new on disc — skipping namer/transfer")
+                notifier.send_discord([], success=True, config=config)
+                continue
+
             titles_ordered = sorted(titles, key=lambda t: t["title_index"], reverse=True)
             named = namer.identify(volume_name, titles_ordered, config.anthropic_api_key, existing_episodes=existing)
             log.info(f"Named {len(named)} title(s)")

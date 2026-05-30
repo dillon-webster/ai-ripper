@@ -84,6 +84,19 @@ def test_send_all_retries_on_scp_failure(tmp_path):
     assert len(result) == 1
 
 
+def test_send_all_skips_existing_file(tmp_path):
+    titles = _make_titled(tmp_path)
+    config = _make_config()
+
+    with patch("modules.transfer._ssh_mkdir"), \
+         patch("modules.transfer._remote_file_exists", return_value=True), \
+         patch("modules.transfer._scp") as mock_scp:
+        result = send_all(titles, config)
+
+    mock_scp.assert_not_called()
+    assert result == []
+
+
 def test_send_all_raises_after_all_retries_fail(tmp_path):
     titles = _make_titled(tmp_path)
     config = _make_config()

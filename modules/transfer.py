@@ -4,7 +4,7 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +77,40 @@ def list_existing_episodes(config) -> List[str]:
     return [Path(line.strip()).name for line in result.stdout.splitlines() if line.strip()]
 
 
+def list_existing_episodes_with_duration(config) -> List[Tuple[str, int]]:
+    """
+    Return list of (filename, duration_secs) for existing TV episodes on the server.
+    Uses ffprobe over SSH. Returns [] if the call fails or ffprobe isn't available
+    (callers should treat that as 'no dedup info' and proceed without filtering).
+    """
+    media_root = shlex.quote(config.media_root)
+    remote_cmd = (
+        f"find -L {media_root}/tvshows -name '*.mkv' -print0 | "
+        f"xargs -0 -I{{}} sh -c "
+        f"'printf \"%s\\t\" \"$(basename \"$1\")\"; "
+        f"ffprobe -v error -show_entries format=duration -of csv=p=0 \"$1\"' _ {{}}"
+    )
+    result = subprocess.run(
+        ["ssh", *SSH_OPTS, f"{config.server_user}@{config.server_ip}", remote_cmd],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        log.warning(f"Could not fetch existing episode durations: {result.stderr.strip()}")
+        return []
+
+    out = []
+    for line in result.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        name, dur_str = line.split("\t", 1)
+        try:
+            out.append((name.strip(), int(float(dur_str.strip()))))
+        except ValueError:
+            continue
+    return out
+
+
 def send_all(named_titles: List[Dict], config) -> List[str]:
     """
     SCP each title to the home server in the proper Jellyfin directory structure.
@@ -102,7 +136,8 @@ def send_all(named_titles: List[Dict], config) -> List[str]:
             try:
                 _ssh_mkdir(remote_dir, config)
                 if _remote_file_exists(remote_file, config):
-                    raise TransferError(f"{filename} already exists on server — refusing to overwrite")
+                    log.info(f"Skipping {filename} — already exists on server")
+                    break
                 _scp(title["path"], remote)
                 remote_paths.append(remote)
                 log.info(f"Transferred: {filename} → {remote}")

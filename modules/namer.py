@@ -50,8 +50,9 @@ For each title, determine what movie or TV show episode it contains and return t
 
 IMPORTANT for multi-disc TV sets:
 - The disc volume label encodes the show, season, and disc number (e.g. "FRIENDS SEASON 2-A1" means Friends Season 2 Disc 1).
-- Look at the existing files on the server to determine the correct starting episode number for this disc:
-  - If this disc's show/season already has episodes on the server, continue numbering from the next one (e.g. if S01E12 exists, start at S01E13).
+- Look at the existing files on the server to determine the correct episode number(s) for this disc:
+  - FIRST check for gaps in the existing file list — episode numbers missing between the lowest and highest existing number in this season. If the disc title's duration and position make it a plausible fit for a gap, use that gap's episode number (e.g. existing files are S02E07, S02E09, S02E10 → S02E08 is the gap; a single new title from a Season 2 disc likely belongs at S02E08).
+  - If there are no gaps (or this title clearly comes after the highest existing one), continue numbering from the next one (e.g. if S01E12 exists, start at S01E13).
   - If this disc is a new season that has no episodes yet, start at E01 of that season (e.g. if only S01 exists and this disc is Season 2, start at S02E01).
 - Never reuse an episode number that already exists in the server file list above.
 
