@@ -1,5 +1,6 @@
 import os
 import platform
+import string
 import time
 from pathlib import Path
 from typing import List, Set, Tuple
@@ -7,10 +8,17 @@ from typing import List, Set, Tuple
 POLL_INTERVAL = 5  # seconds
 
 
+def _windows_drives() -> List[Path]:
+    """Return all drive letter root paths that currently exist on Windows."""
+    return [Path(f"{d}:\\") for d in string.ascii_uppercase if Path(f"{d}:\\").exists()]
+
+
 def _mount_roots() -> List[Path]:
     """Return candidate mount-point directories for the current OS."""
     if platform.system() == "Darwin":
         return [Path("/Volumes")]
+    if platform.system() == "Windows":
+        return _windows_drives()
     # Linux: udisks2/udev mounts under /media/$USER or /run/media/$USER
     username = os.getenv("USER") or os.getenv("LOGNAME") or ""
     candidates = [Path(f"/media/{username}"), Path(f"/run/media/{username}")]
@@ -22,6 +30,9 @@ def _mount_roots() -> List[Path]:
 
 def _list_volumes() -> Set[Path]:
     """Return current set of mounted volumes. Isolated for testability."""
+    if platform.system() == "Windows":
+        # On Windows each drive root is the volume itself, not a parent to iterate.
+        return {p for p in _windows_drives() if p.exists()}
     volumes: Set[Path] = set()
     for root in _mount_roots():
         if root.exists():
