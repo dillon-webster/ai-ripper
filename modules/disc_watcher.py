@@ -35,12 +35,21 @@ def _is_optical_disc(volume_path: Path) -> bool:
 
 def wait_for_disc() -> Tuple[str, Path]:
     """Block until an optical disc is inserted. Returns (volume_name, volume_path)."""
-    known = _list_volumes()
+    # Track optical discs we've already handled by path. We deliberately do NOT
+    # remember non-optical volumes: udisks2 creates the mount-point directory a
+    # beat before VIDEO_TS/BDMV becomes stat-able, so a freshly inserted disc can
+    # look non-optical on the first poll. If we folded that path into a "known"
+    # set, it would never be re-examined once the filesystem finished mounting
+    # (the bug that made inserted discs go unseen). Instead we re-check every
+    # volume each poll and only suppress discs we've actually returned before.
+    handled: Set[Path] = {p for p in _list_volumes() if _is_optical_disc(p)}
     while True:
         current = _list_volumes()
-        new_volumes = current - known
-        for path in new_volumes:
-            if _is_optical_disc(path):
+        for path in current:
+            if _is_optical_disc(path) and path not in handled:
+                handled.add(path)
                 return path.name, path
-        known = current
+        # Drop discs that have been ejected so a re-insert at the same path
+        # (box sets reuse volume labels) is detected again.
+        handled &= current
         time.sleep(POLL_INTERVAL)

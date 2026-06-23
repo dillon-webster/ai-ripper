@@ -1,6 +1,7 @@
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -8,7 +9,8 @@ log = logging.getLogger(__name__)
 
 MIN_TITLE_DURATION_SECS = 300  # 5 minutes — skip extras/menus
 PLAY_ALL_TOLERANCE = 0.10  # title within 10% of sum of others is "Play All"
-DUP_DURATION_TOLERANCE_SECS = 5  # duration match window for re-rip duplicate detection
+INFO_SCAN_ATTEMPTS = 5  # retry the disc info scan while the drive spins up
+INFO_SCAN_RETRY_SECS = 6  # wait between info-scan attempts
 
 
 class RipError(Exception):
@@ -47,27 +49,36 @@ def _parse_title_index(filename: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def rip(volume_path: Path, temp_dir: Path, existing_durations: List[int] = None) -> List[Dict]:
+def rip(volume_path: Path, temp_dir: Path) -> List[Dict]:
     """
     Rip eligible titles from the disc to temp_dir.
     Returns list of dicts: [{path, duration_secs, title_index}].
-    Titles outside [MIN, MAX] duration range are excluded BEFORE ripping
-    (skips menus/extras and TV "Play All" combined titles).
-    If `existing_durations` is provided, titles whose duration matches an
-    already-present server episode (±DUP_DURATION_TOLERANCE_SECS) are skipped
-    too, enabling safe re-rips of partially-transferred discs.
+    Titles below MIN_TITLE_DURATION_SECS are excluded BEFORE ripping (skips
+    menus/extras), as is the TV "Play All" combined title.
     Raises RipError on failure.
     """
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Phase 1: get title metadata
+    # Phase 1: get title metadata. Right after insertion the drive may still be
+    # spinning up, so makemkvcon can return an empty list — retry a few times
+    # before giving up rather than failing the whole disc on a cold drive.
     log.info("Querying disc info...")
-    info_result = subprocess.run(
-        ["makemkvcon", "-r", "info", "disc:0"],
-        capture_output=True,
-        text=True,
-    )
-    title_info = _parse_info(info_result.stdout)
+    title_info: Dict[int, Dict] = {}
+    for attempt in range(1, INFO_SCAN_ATTEMPTS + 1):
+        info_result = subprocess.run(
+            ["makemkvcon", "-r", "info", "disc:0"],
+            capture_output=True,
+            text=True,
+        )
+        title_info = _parse_info(info_result.stdout)
+        if title_info:
+            break
+        if attempt < INFO_SCAN_ATTEMPTS:
+            log.warning(
+                f"No titles read from disc (attempt {attempt}/{INFO_SCAN_ATTEMPTS}) — "
+                f"drive may still be spinning up; retrying in {INFO_SCAN_RETRY_SECS}s"
+            )
+            time.sleep(INFO_SCAN_RETRY_SECS)
 
     # Filter titles by minimum duration (drop menus/extras)
     eligible_indices = []
@@ -92,27 +103,6 @@ def rip(volume_path: Path, temp_dir: Path, existing_durations: List[int] = None)
 
     if not eligible_indices:
         raise RipError("No eligible titles found on disc after duration filtering")
-
-    # Drop titles that duplicate an existing server episode by duration
-    if existing_durations:
-        remaining_existing = list(existing_durations)
-        filtered = []
-        for idx in eligible_indices:
-            dur = title_info[idx].get("duration_secs", 0)
-            match = next(
-                (d for d in remaining_existing if dur > 0 and abs(dur - d) <= DUP_DURATION_TOLERANCE_SECS),
-                None,
-            )
-            if match is not None:
-                log.info(f"Skipping title #{idx} ({dur}s — matches existing episode at {match}s)")
-                remaining_existing.remove(match)
-            else:
-                filtered.append(idx)
-        eligible_indices = filtered
-
-    if not eligible_indices:
-        log.info("All eligible disc titles already on server — nothing to rip")
-        return []
 
     # Phase 2: rip eligible titles one at a time
     log.info(f"Ripping {len(eligible_indices)} title(s) to {temp_dir}...")

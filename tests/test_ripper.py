@@ -77,56 +77,39 @@ def test_rip_raises_on_makemkv_failure(tmp_path):
             rip(Path("/Volumes/FAKE_DISC"), tmp_path)
 
 
-def test_rip_skips_titles_matching_existing_durations(tmp_path):
-    # Three eligible titles; two match existing-server durations (within ±5s) and should be dropped
-    info_output = (
-        'TINFO:0,9,0,"0:24:55"\n'  # 1495s — matches existing 1493s
-        'TINFO:1,9,0,"0:22:44"\n'  # 1364s — no match, keep
-        'TINFO:2,9,0,"0:24:06"\n'  # 1446s — matches existing 1446s
-    )
+def test_rip_retries_info_scan_while_drive_spins_up(tmp_path):
+    # First info scan returns nothing (cold drive); second returns a real title.
+    info_output = 'TINFO:0,9,0,"0:22:00"\n'
     (tmp_path / "title_t00.mkv").write_bytes(b"x")
-    (tmp_path / "title_t01.mkv").write_bytes(b"x")
-    (tmp_path / "title_t02.mkv").write_bytes(b"x")
-
-    rip_calls = []
+    info_calls = {"n": 0}
 
     def fake_run(cmd, **kwargs):
         mock = MagicMock()
         mock.returncode = 0
         if "info" in cmd:
-            mock.stdout = info_output
-        else:
-            rip_calls.append(cmd)
+            info_calls["n"] += 1
+            mock.stdout = "" if info_calls["n"] == 1 else info_output
         return mock
 
-    with patch("modules.ripper.subprocess.run", side_effect=fake_run):
-        titles = rip(Path("/Volumes/FAKE_DISC"), tmp_path, existing_durations=[1493, 1446])
+    with patch("modules.ripper.time.sleep"), \
+         patch("modules.ripper.subprocess.run", side_effect=fake_run):
+        titles = rip(Path("/Volumes/FAKE_DISC"), tmp_path)
 
-    # Only title_t01 (1364s) survives dedup
+    assert info_calls["n"] == 2  # retried once, then succeeded
     assert len(titles) == 1
-    assert titles[0]["title_index"] == 1
-    # makemkvcon mkv should have been called only for title 1 (not 0 or 2)
-    ripped_indices = [c[3] for c in rip_calls]
-    assert ripped_indices == ["1"]
 
 
-def test_rip_returns_empty_when_all_titles_already_on_server(tmp_path):
-    info_output = (
-        'TINFO:0,9,0,"0:24:55"\n'
-        'TINFO:1,9,0,"0:22:44"\n'
-    )
-
+def test_rip_raises_after_all_info_scans_empty(tmp_path):
     def fake_run(cmd, **kwargs):
         mock = MagicMock()
         mock.returncode = 0
-        if "info" in cmd:
-            mock.stdout = info_output
+        mock.stdout = ""  # drive never returns titles
         return mock
 
-    with patch("modules.ripper.subprocess.run", side_effect=fake_run):
-        titles = rip(Path("/Volumes/FAKE_DISC"), tmp_path, existing_durations=[1495, 1364])
-
-    assert titles == []
+    with patch("modules.ripper.time.sleep"), \
+         patch("modules.ripper.subprocess.run", side_effect=fake_run):
+        with pytest.raises(RipError, match="No eligible titles"):
+            rip(Path("/Volumes/FAKE_DISC"), tmp_path)
 
 
 def test_rip_raises_when_no_mkv_files_produced(tmp_path):

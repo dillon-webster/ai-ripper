@@ -40,3 +40,32 @@ def test_wait_for_disc_returns_on_new_optical_volume(tmp_path):
 
     assert name == "FRIENDS_S1D2"
     assert path == disc_path
+
+
+def test_wait_for_disc_detects_disc_that_mounts_before_video_ts(tmp_path):
+    # Regression: udisks2 exposes the mount-point directory a poll before
+    # VIDEO_TS is stat-able. The disc must still be detected once it appears,
+    # not permanently written off as a non-optical volume.
+    disc_path = tmp_path / "FRIENDS_SEASON6_DISC2"
+
+    calls = {"n": 0}
+
+    def list_volumes():
+        # poll 0: startup baseline, drive empty
+        # poll 1: mount-point dir present but VIDEO_TS not stat-able yet
+        # poll 2: filesystem fully mounted
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return set()
+        if calls["n"] == 2:
+            disc_path.mkdir(exist_ok=True)  # dir exists, no VIDEO_TS
+            return {disc_path}
+        (disc_path / "VIDEO_TS").mkdir(exist_ok=True)
+        return {disc_path}
+
+    with patch("modules.disc_watcher._list_volumes", side_effect=list_volumes), \
+         patch("modules.disc_watcher.POLL_INTERVAL", 0):
+        name, path = wait_for_disc()
+
+    assert name == "FRIENDS_SEASON6_DISC2"
+    assert path == disc_path

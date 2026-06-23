@@ -46,8 +46,11 @@ def main() -> None:
         log.info(f"Disc detected: {volume_name} at {volume_path}")
 
         try:
-            prior_durations = transfer.load_disc_history_durations(volume_name, config)
-            titles = disc_ripper.rip(volume_path, config.temp_dir, existing_durations=prior_durations)
+            # Duration-based dedup is DISABLED: many box sets give every disc the
+            # same volume label (e.g. "FRIENDS_SERIES_3"), so matching titles by
+            # length across discs silently skipped real episodes. Rip every title;
+            # the namer handles numbering. (Revisit only with a whole-disc fingerprint.)
+            titles = disc_ripper.rip(volume_path, config.temp_dir)
             log.info(f"Ripped {len(titles)} title(s)")
 
             if not titles:
@@ -56,14 +59,15 @@ def main() -> None:
                 continue
 
             existing = transfer.list_existing_episodes(config)
+            # reverse=True is INTENTIONAL and verified — do NOT change without testing
+            # on a real disc. Passing titles ascending produced reversed episode numbers
+            # (the bug fixed in commit 82e8601); descending is what names them correctly.
             titles_ordered = sorted(titles, key=lambda t: t["title_index"], reverse=True)
             named = namer.identify(volume_name, titles_ordered, config.anthropic_api_key, existing_episodes=existing)
             log.info(f"Named {len(named)} title(s)")
 
             transfer.send_all(named, config)
             log.info("Transfer complete")
-
-            transfer.record_disc_history(volume_name, named, config)
 
             notifier.trigger_jellyfin_scan(config)
             notifier.send_discord(

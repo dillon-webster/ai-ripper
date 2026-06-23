@@ -1,13 +1,10 @@
-import json
 import logging
 import re
 import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
-
-HISTORY_FILENAME = ".ai_ripper_history.json"
+from typing import Dict, List
 
 log = logging.getLogger(__name__)
 
@@ -78,62 +75,6 @@ def list_existing_episodes(config) -> List[str]:
     if result.returncode != 0:
         return []
     return [Path(line.strip()).name for line in result.stdout.splitlines() if line.strip()]
-
-
-def _history_path(config) -> str:
-    return f"{config.media_root}/{HISTORY_FILENAME}"
-
-
-def _read_history(config) -> Dict[str, List[Dict]]:
-    result = subprocess.run(
-        ["ssh", *SSH_OPTS, f"{config.server_user}@{config.server_ip}",
-         f"cat {shlex.quote(_history_path(config))} 2>/dev/null || echo '{{}}'"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return {}
-    try:
-        data = json.loads(result.stdout or "{}")
-        return data if isinstance(data, dict) else {}
-    except json.JSONDecodeError:
-        log.warning("Disc history file is corrupt; treating as empty")
-        return {}
-
-
-def load_disc_history_durations(volume_name: str, config) -> List[int]:
-    """
-    Return list of duration_secs for titles previously ripped from THIS volume label.
-    Empty list if this disc has never been ripped — meaning no dedup will happen.
-    Scoping by volume label avoids false-positive matches against other episodes
-    of the same show (they're all similar lengths).
-    """
-    history = _read_history(config)
-    entries = history.get(volume_name, [])
-    return [int(e["duration_secs"]) for e in entries if "duration_secs" in e]
-
-
-def record_disc_history(volume_name: str, titles: List[Dict], config) -> None:
-    """Persist this disc's titles (title_index, duration, jellyfin_filename) to the server-side history."""
-    history = _read_history(config)
-    history[volume_name] = [
-        {
-            "title_index": t.get("title_index"),
-            "duration_secs": t.get("duration_secs"),
-            "jellyfin_filename": t.get("jellyfin_filename"),
-        }
-        for t in titles
-    ]
-    payload = json.dumps(history, indent=2)
-    result = subprocess.run(
-        ["ssh", *SSH_OPTS, f"{config.server_user}@{config.server_ip}",
-         f"cat > {shlex.quote(_history_path(config))}"],
-        input=payload,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log.warning(f"Could not write disc history: {result.stderr.strip()}")
 
 
 def send_all(named_titles: List[Dict], config) -> List[str]:
