@@ -21,7 +21,49 @@ def _duration_hms(secs: int) -> str:
     return f"{h}:{m:02d}:{s:02d}"
 
 
-def _build_prompt(volume_name: str, titles: List[Dict], existing_episodes: List[str] = None) -> str:
+def _show_key(name: str) -> str:
+    """Normalize a show label to a comparison key: lowercase alphanumerics only.
+    'Family.Guy' and 'FAMILY_GUY' both become 'familyguy'."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _scope_existing(existing: List[str], volume_name: str, season: int) -> List[str]:
+    """Filter existing server filenames down to the SAME show (per the volume label)
+    and the SAME season. Without this the namer sees every show/season at once and
+    counts episode numbers across the boundary (e.g. Season 1's 7 episodes made a
+    Season 2 disc start at E08 instead of E01)."""
+    # Isolate the show name from the volume label by stripping the numbering tokens
+    # discs carry — DISC/D, VOLUME/VOL, SEASON/SERIES/S — wherever they appear, not
+    # just at the end. A trailing-only strip left "FAMILY_GUY_VOLUME_13_DISC_2" as
+    # "familyguyvolume13", which never matched "familyguy" and silently discarded
+    # every existing episode, restarting numbering at E01.
+    show_label = re.sub(
+        r"[_\s-]*\b(disc|d|volume|vol|season|series|s)\b[_\s-]*\d+",
+        " ", volume_name, flags=re.IGNORECASE,
+    )
+    want_show = _show_key(show_label)
+    want_tag = f"S{season:02d}E"
+    scoped = []
+    for e in existing:
+        m = re.match(r"^(.*?)\.S\d{2}E", e, re.IGNORECASE)
+        if not m or want_tag not in e.upper():
+            continue
+        file_show = _show_key(m.group(1))
+        # Tolerate leftover label tokens by accepting a prefix-subset match in either
+        # direction, not just equality (e.g. label "familyguyvolume13" vs file
+        # "familyguy"). Guards against matching a different show while surviving a
+        # label that still carries extra words.
+        if file_show and want_show and (
+            file_show == want_show
+            or file_show.startswith(want_show)
+            or want_show.startswith(file_show)
+        ):
+            scoped.append(e)
+    return scoped
+
+
+def _build_prompt(volume_name: str, titles: List[Dict], existing_episodes: List[str] = None,
+                  season: int = None, disc: int = None) -> str:
     title_list = [
         {
             "index": t["title_index"],
@@ -30,17 +72,41 @@ def _build_prompt(volume_name: str, titles: List[Dict], existing_episodes: List[
         }
         for t in titles
     ]
+    shown_existing = list(existing_episodes) if existing_episodes else []
+    if season is not None and shown_existing:
+        shown_existing = _scope_existing(shown_existing, volume_name, season)
+
     existing_section = ""
-    if existing_episodes:
+    if shown_existing:
+        scope_note = f" for Season {season} of this show" if season is not None else ""
         existing_section = (
-            "\nFiles already on the server:\n"
-            + "\n".join(f"  {e}" for e in sorted(existing_episodes))
+            f"\nFiles already on the server{scope_note}:\n"
+            + "\n".join(f"  {e}" for e in sorted(shown_existing))
             + "\n"
+        )
+
+    override_section = ""
+    if season is not None:
+        disc_line = (
+            f"- This is DISC {disc} of that season; earlier discs hold earlier episodes.\n"
+            if disc is not None else ""
+        )
+        override_section = (
+            "\nMANUAL OVERRIDE (authoritative — trust this over the volume label and any inference):\n"
+            f"- Every TV title on this disc belongs to SEASON {season} of the show named by the volume label.\n"
+            f"- Use season number {season:02d} (e.g. S{season:02d}E01). Do NOT infer the season from the "
+            "volume label or the existing files — the label may omit or misstate the season.\n"
+            f"{disc_line}"
+            f"- The listed server files (if any) are ONLY Season {season} of this show. Number episodes "
+            f"WITHIN Season {season}: continue after the highest listed episode, or fill a gap in it.\n"
+            f"- If NO Season {season} files are listed, this is the first disc of the season — start at E01. "
+            "Do NOT carry a running count over from an earlier season.\n"
         )
 
     return f"""You are identifying content from a DVD/Blu-ray disc for Jellyfin media server organization.
 
 Disc volume label: {volume_name}
+{override_section}
 Titles on disc:
 {json.dumps(title_list, indent=2)}
 {existing_section}
@@ -58,6 +124,16 @@ IMPORTANT for multi-disc TV sets:
 IMPORTANT for episode ordering: Titles are listed in disc playback order (first episode first). Assign episode
 numbers sequentially in the order they are presented — do NOT reorder them.
 
+IMPORTANT for movie discs (bonus content):
+- A movie disc usually has ONE main feature (the film itself, typically 70+ min) plus bonus content:
+  director/cast commentary tracks (often the SAME length as the film), featurettes, "making of"
+  documentaries, deleted scenes, and gag reels.
+- Set "is_extra": true for every movie title that is NOT the main feature. Set "is_extra": false for the
+  main feature. When two titles have the same duration (the film + a commentary version), the commentary
+  version is the extra — keep only ONE as the main feature.
+- Use duration and the title filename as clues. This flag applies to MOVIES ONLY.
+- For TV episodes, ALWAYS set "is_extra": false. Every episode is real content that must be kept.
+
 IMPORTANT for double-length / two-part episodes:
 - A single title whose duration is roughly DOUBLE the typical episode length on this disc (e.g. ~44+ min when the
   other episodes run ~22 min) is almost always a special that aired as one feature-length episode but that episode
@@ -74,7 +150,8 @@ Return ONLY a valid JSON array with no other text, markdown, or explanation:
     "index": <title_index as integer>,
     "jellyfin_filename": "<name>.mkv",
     "media_type": "movie" or "tv",
-    "destination": "movies" or "tvshows"
+    "destination": "movies" or "tvshows",
+    "is_extra": true or false
   }}
 ]
 
@@ -90,14 +167,17 @@ def _strip_fences(text: str) -> str:
     return m.group(1) if m else text
 
 
-def identify(volume_name: str, titles: List[Dict], api_key: str, existing_episodes: List[str] = None) -> List[Dict]:
+def identify(volume_name: str, titles: List[Dict], api_key: str, existing_episodes: List[str] = None,
+             season: int = None, disc: int = None) -> List[Dict]:
     """
     Call Anthropic API to identify titles and generate Jellyfin-compatible filenames.
     Returns original title dicts merged with naming fields.
+    When `season` is given it is authoritative — the model uses it verbatim instead of
+    inferring the season from the (possibly season-less) volume label.
     Raises NamerError if JSON parsing fails after one retry.
     """
     client = anthropic.Anthropic(api_key=api_key)
-    prompt = _build_prompt(volume_name, titles, existing_episodes)
+    prompt = _build_prompt(volume_name, titles, existing_episodes, season=season, disc=disc)
 
     messages = [{"role": "user", "content": prompt}]
 

@@ -7,8 +7,12 @@ from typing import Dict, List
 
 log = logging.getLogger(__name__)
 
-MIN_TITLE_DURATION_SECS = 300  # 5 minutes — skip extras/menus
+MIN_TITLE_DURATION_SECS = 960  # 16 minutes — a real ~21-min episode clears this, but
+# short bonuses/fragments (deleted scenes, 5–15 min featurettes, animatic teasers) don't.
+# NOTE: assumes ~20-min+ episodes. A show with genuinely short episodes (e.g. 11-min
+# cartoons) would need this lowered.
 PLAY_ALL_TOLERANCE = 0.10  # title within 10% of sum of others is "Play All"
+MIN_CLUSTER_TO_PRUNE = 3  # only prune outlier source sets when one set has >= this many titles
 INFO_SCAN_ATTEMPTS = 5  # retry the disc info scan while the drive spins up
 INFO_SCAN_RETRY_SECS = 6  # wait between info-scan attempts
 
@@ -40,7 +44,43 @@ def _parse_info(output: str) -> Dict[int, Dict]:
             titles[title_idx] = {}
         if code == 9:  # duration field
             titles[title_idx]["duration_secs"] = _hms_to_secs(value)
+        elif code == 49:  # source-set label (VTS), e.g. "B1" — shared by a disc's real episodes
+            titles[title_idx]["source_set"] = value
     return titles
+
+
+def _prune_outlier_source_sets(indices: List[int], title_info: Dict[int, Dict]):
+    """Drop titles that sit ALONE in their own source set when a clear real-episode
+    cluster exists. Returns (kept_indices, dropped_indices).
+
+    Full-length bonus features — animatic/storyboard versions of an episode, cell-scramble
+    copy-protection decoys — run the SAME ~22 min as a real episode, so the duration floor
+    can't catch them. But a disc's real episodes all come from ONE MakeMKV source set (VTS),
+    while each such bonus lives in its own. So when one source set holds the bulk of the
+    titles (>= MIN_CLUSTER_TO_PRUNE), any source set contributing just a single title is
+    almost certainly a bonus, and is dropped.
+
+    Guards against false drops:
+    - If no source set reaches MIN_CLUSTER_TO_PRUNE (e.g. a disc that legitimately spreads
+      episodes one-per-source-set), nothing is pruned.
+    - A second genuine cluster (>= 2 titles) is kept — only true singletons are dropped.
+    - Titles with an unknown source set are never dropped.
+    """
+    counts: Dict[str, int] = {}
+    for idx in indices:
+        ss = title_info.get(idx, {}).get("source_set")
+        if ss:
+            counts[ss] = counts.get(ss, 0) + 1
+    if not counts or max(counts.values()) < MIN_CLUSTER_TO_PRUNE:
+        return list(indices), []
+    kept, dropped = [], []
+    for idx in indices:
+        ss = title_info.get(idx, {}).get("source_set")
+        if ss and counts.get(ss, 0) == 1:
+            dropped.append(idx)
+        else:
+            kept.append(idx)
+    return kept, dropped
 
 
 def _parse_title_index(filename: str) -> int:
@@ -91,6 +131,16 @@ def rip(volume_path: Path, temp_dir: Path) -> List[Dict]:
             log.info(f"Skipping title #{idx} (duration {dur}s < {MIN_TITLE_DURATION_SECS}s — extra/menu)")
         else:
             eligible_indices.append(idx)
+
+    # Drop full-length bonus features (animatics, cell-scramble decoys) that the duration
+    # floor can't catch: they occupy their own source set while a disc's real episodes share
+    # one. See _prune_outlier_source_sets for the guards against false drops.
+    pruned, dropped = _prune_outlier_source_sets(eligible_indices, title_info)
+    for idx in sorted(dropped):
+        ss = title_info.get(idx, {}).get("source_set")
+        dur = title_info.get(idx, {}).get("duration_secs", 0)
+        log.info(f"Skipping title #{idx} (source set {ss}, lone outlier — likely bonus/animatic, {dur}s)")
+    eligible_indices = pruned
 
     # Detect "Play All": if the longest title ≈ sum of the others, drop it
     if len(eligible_indices) >= 3:

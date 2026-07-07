@@ -1,7 +1,9 @@
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
-from modules.ripper import _parse_info, _hms_to_secs, _parse_title_index, rip, RipError
+from modules.ripper import (
+    _parse_info, _hms_to_secs, _parse_title_index, _prune_outlier_source_sets, rip, RipError,
+)
 
 
 def test_hms_to_secs_standard():
@@ -26,14 +28,63 @@ def test_parse_info_extracts_durations():
     assert result[1]["duration_secs"] == 1335
 
 
+def test_parse_info_captures_source_set():
+    output = (
+        'TINFO:0,9,0,"0:21:35"\n'
+        'TINFO:0,49,0,"B1"\n'
+        'TINFO:1,9,0,"0:22:38"\n'
+        'TINFO:1,49,0,"J1"\n'
+    )
+    result = _parse_info(output)
+    assert result[0]["source_set"] == "B1"
+    assert result[1]["source_set"] == "J1"
+
+
 def test_parse_title_index_from_filename():
     assert _parse_title_index("title_t00.mkv") == 0
     assert _parse_title_index("title_t03.mkv") == 3
     assert _parse_title_index("title_t12.mkv") == 12
 
 
+def test_prune_drops_lone_source_set_outliers():
+    # Family Guy S12 disc 2: 7 real episodes share source set "B1"; the full-length
+    # animatic ("J1") and the cell-scramble decoy ("K1") each sit alone. Both are the
+    # same ~22 min as an episode, so only the source set separates them.
+    title_info = {i: {"source_set": "B1", "duration_secs": 1300} for i in range(7)}
+    title_info[7] = {"source_set": "J1", "duration_secs": 1358}  # animatic
+    title_info[8] = {"source_set": "K1", "duration_secs": 1372}  # scramble decoy
+    kept, dropped = _prune_outlier_source_sets(list(range(9)), title_info)
+    assert kept == list(range(7))
+    assert dropped == [7, 8]
+
+
+def test_prune_keeps_all_when_no_dominant_cluster():
+    # Every title in its own source set (no cluster reaches the threshold) → prune nothing.
+    title_info = {i: {"source_set": f"S{i}", "duration_secs": 1300} for i in range(2)}
+    kept, dropped = _prune_outlier_source_sets([0, 1], title_info)
+    assert kept == [0, 1]
+    assert dropped == []
+
+
+def test_prune_keeps_second_genuine_cluster():
+    # A disc split across two VTS (4 + 3 real episodes) — neither is a singleton, keep all.
+    title_info = {i: {"source_set": "A1", "duration_secs": 1300} for i in range(4)}
+    title_info.update({i: {"source_set": "B1", "duration_secs": 1300} for i in range(4, 7)})
+    kept, dropped = _prune_outlier_source_sets(list(range(7)), title_info)
+    assert kept == list(range(7))
+    assert dropped == []
+
+
+def test_prune_noop_when_source_set_unknown():
+    # Older MakeMKV / parse miss: no source_set on any title → never drop anything.
+    title_info = {i: {"duration_secs": 1300} for i in range(5)}
+    kept, dropped = _prune_outlier_source_sets(list(range(5)), title_info)
+    assert kept == list(range(5))
+    assert dropped == []
+
+
 def test_rip_returns_titles_with_duration(tmp_path):
-    # title_t00: 1:42:07 = 6127s (kept), title_t01: 0:04:15 = 255s < 300s threshold (filtered)
+    # title_t00: 1:42:07 = 6127s (kept), title_t01: 0:04:15 = 255s < 960s floor (filtered)
     info_output = (
         'TINFO:0,9,0,"1:42:07"\n'
         'TINFO:1,9,0,"0:04:15"\n'
@@ -57,6 +108,58 @@ def test_rip_returns_titles_with_duration(tmp_path):
     assert titles[0]["title_index"] == 0
     assert titles[0]["duration_secs"] == 6127
     assert titles[0]["path"] == tmp_path / "title_t00.mkv"
+
+
+def test_rip_prunes_full_length_bonus_by_source_set(tmp_path):
+    # 3 real episodes (source "B1") + 1 full-length animatic (source "J1"), all > 16 min.
+    # The animatic must be pruned as a lone-source-set outlier and never ripped.
+    info_output = (
+        'TINFO:0,9,0,"0:21:35"\nTINFO:0,49,0,"B1"\n'
+        'TINFO:1,9,0,"0:22:07"\nTINFO:1,49,0,"B1"\n'
+        'TINFO:2,9,0,"0:21:40"\nTINFO:2,49,0,"B1"\n'
+        'TINFO:3,9,0,"0:22:38"\nTINFO:3,49,0,"J1"\n'
+    )
+    for name in ("B1_t00.mkv", "B1_t01.mkv", "B1_t02.mkv", "J1_t03.mkv"):
+        (tmp_path / name).write_bytes(b"x")
+
+    ripped = []
+
+    def fake_run(cmd, **kwargs):
+        mock = MagicMock()
+        mock.returncode = 0
+        if "info" in cmd:
+            mock.stdout = info_output
+        elif "mkv" in cmd:
+            ripped.append(cmd[3])  # title-index argument to `makemkvcon mkv`
+        return mock
+
+    with patch("modules.ripper.subprocess.run", side_effect=fake_run):
+        titles = rip(Path("/Volumes/FAKE_DISC"), tmp_path)
+
+    assert sorted(t["title_index"] for t in titles) == [0, 1, 2]  # animatic excluded
+    assert "3" not in ripped  # and never even ripped
+
+
+def test_rip_filters_sub_16min_bonus(tmp_path):
+    # A 15:09 (909s) featurette is below the 960s floor and must be dropped.
+    info_output = (
+        'TINFO:0,9,0,"0:21:35"\n'
+        'TINFO:1,9,0,"0:15:09"\n'
+    )
+    (tmp_path / "title_t00.mkv").write_bytes(b"x")
+    (tmp_path / "title_t01.mkv").write_bytes(b"x")
+
+    def fake_run(cmd, **kwargs):
+        mock = MagicMock()
+        mock.returncode = 0
+        if "info" in cmd:
+            mock.stdout = info_output
+        return mock
+
+    with patch("modules.ripper.subprocess.run", side_effect=fake_run):
+        titles = rip(Path("/Volumes/FAKE_DISC"), tmp_path)
+
+    assert [t["title_index"] for t in titles] == [0]
 
 
 def test_rip_raises_on_makemkv_failure(tmp_path):

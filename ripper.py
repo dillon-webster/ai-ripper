@@ -37,9 +37,15 @@ def eject_disc(volume_path: Path) -> None:
     log.info("Disc ejected")
 
 
-def main() -> None:
+def main(season: int = None, disc: int = None) -> None:
     config = load_config()
     log.info("DVD Auto-Ripper started. Waiting for disc...")
+    if season is not None:
+        log.info(
+            f"Manual override active: Season {season}"
+            + (f", Disc {disc}" if disc is not None else "")
+            + " — this applies to every disc until the ripper is restarted."
+        )
 
     while True:
         volume_name, volume_path = disc_watcher.wait_for_disc()
@@ -63,8 +69,23 @@ def main() -> None:
             # on a real disc. Passing titles ascending produced reversed episode numbers
             # (the bug fixed in commit 82e8601); descending is what names them correctly.
             titles_ordered = sorted(titles, key=lambda t: t["title_index"], reverse=True)
-            named = namer.identify(volume_name, titles_ordered, config.anthropic_api_key, existing_episodes=existing)
+            named = namer.identify(
+                volume_name, titles_ordered, config.anthropic_api_key,
+                existing_episodes=existing, season=season, disc=disc,
+            )
             log.info(f"Named {len(named)} title(s)")
+
+            # Drop movie bonus content (commentary tracks, featurettes) so only the
+            # main feature transfers. The namer only ever sets is_extra on titles it
+            # classified as a movie — TV episodes always carry is_extra=false — so this
+            # cannot skip an episode. Fallback: if this would drop EVERYTHING (namer
+            # mis-flagged every title), keep them all rather than transfer nothing.
+            kept = [t for t in named if not t.get("is_extra")]
+            if kept and len(kept) < len(named):
+                for t in named:
+                    if t.get("is_extra"):
+                        log.info(f"Skipping movie extra: {t['jellyfin_filename']}")
+                named = kept
 
             transfer.send_all(named, config)
             log.info("Transfer complete")
@@ -89,4 +110,17 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DVD Auto-Ripper")
+    parser.add_argument(
+        "--season", type=int, default=None,
+        help="Force the season number for every disc this session (overrides the disc label). "
+             "Use when the volume label has no season, e.g. FAMILY_GUY_DISC1.",
+    )
+    parser.add_argument(
+        "--disc", type=int, default=None,
+        help="Disc number within the season (hint for episode numbering when the server is empty).",
+    )
+    args = parser.parse_args()
+    main(season=args.season, disc=args.disc)
