@@ -1,6 +1,6 @@
 # Episode identification rework — progress & next steps
 
-_Last updated: 2026-07-08. Branch: `phase1-provider-aware-episodes`._
+_Last updated: 2026-07-09. Branch: `phase1-provider-aware-episodes`._
 _Full design: [episode-identification-plan.md](./episode-identification-plan.md)._
 
 ## Why we're doing this
@@ -50,15 +50,16 @@ Phase 1 does **not** fix scrambled order. When every episode runs ~22 min there'
 no duration signal, so the model still numbers by playback order. Ordering is
 fixed in Phase 2.
 
-## Phase 2 — content-based identification (module built, not yet wired)
+## Phase 2 — content-based identification (built + wired, opt-in) — 2026-07-09
 
-`modules/identify.py` exists on this branch (`test_identify.py`, 20 tests; 86 total pass):
+`modules/identify.py` + wiring in `ripper.py::main`. **91 tests pass**
+(`test_identify.py` 23, `test_ripper_main.py` 5 incl. the content-ID path + fallback).
 
 - `identify_title(title, candidates, config)` — tries the subtitle path first
-  (ffprobe finds the track → mkvextract pulls VobSub → vobsubocr/tesseract OCR →
-  first ~2 min of dialogue → `claude-opus-4-8` matches it against the Phase-1
-  candidate list), falls back to frames→vision (~3 frames via ffmpeg, skipping the
-  15–50s title montage) when subs are missing/ambiguous. Returns `episode=None`
+  (ffprobe finds the track → mkvextract pulls the VobSub `.idx/.sub` → `vobsub2srt`
+  OCRs to SRT → first ~2 min of dialogue → `claude-opus-4-8` matches it against the
+  Phase-1 candidate list), falls back to frames→vision (~3 frames via ffmpeg, skipping
+  the 15–50s title montage) when subs are missing/ambiguous. Returns `episode=None`
   when nothing matches (bonus/compilation) — never a forced guess.
 - Out-of-list episode numbers from the model are clamped to `None`, so a title can
   never be numbered as an episode the season doesn't have.
@@ -66,28 +67,34 @@ fixed in Phase 2.
   (bonus), and when several titles claim one episode keeps the shortest (real) and
   drops the longer 'Play All' omnibus copies. Nothing is deleted from disk — drops
   are surfaced for the Phase-3 approval step.
-- Model note: `identify.py` uses `claude-opus-4-8` (current default). `namer.py`
-  still pins the older `claude-sonnet-4-6` — left unchanged for now.
+- `build_named_title` / `build_filename` turn a reconciled title into the
+  `jellyfin_filename`/`media_type`/`destination` dict `transfer.send_all` expects.
+- Both `identify.py` and `namer.py` now use `claude-opus-4-8`.
 
-**Wired into `ripper.py::main` (2026-07-09), opt-in behind `--content-id`.** When
-`--content-id --show "X" --season N` is passed and the guide resolves, `name_by_content`
-runs `identify_title` per title → `reconcile` → `build_named_title`, bypassing the
-legacy `sorted(reverse=True)` playback-order namer. Falls back to the legacy namer if
-content-ID keeps nothing (never transfers nothing). `namer.py` model bumped to
-`claude-opus-4-8` too. 91 tests pass (`test_ripper_main.py` covers the content-ID path
-+ the fallback).
+**Wiring (`ripper.py::main`, opt-in behind `--content-id`):** when
+`--content-id --show "X" --season N` is passed and the Jellyfin guide resolves,
+`name_by_content` runs `identify_title` per title → `reconcile` → `build_named_title`,
+**bypassing** the legacy `sorted(reverse=True)` playback-order namer. If content-ID
+keeps nothing it falls back to the legacy namer (never transfers nothing). No flag ⇒
+old behavior, fully unchanged.
 
-**Still TODO for Phase 2:** verify OCR output on a real disc. ffprobe/ffmpeg/mkvextract
-were smoke-tested against a synthesized MKV (track detection + frame grab + degradation
-work). **VobSub OCR uses a patched `vobsub2srt`.** History: upstream `vobsub2srt` won't
-build on Tesseract 5 (removed API); tried `vobsubocr` (Rust) instead — its leptonica
-bindings won't build on leptonica 1.86 either. Landed on patching `vobsub2srt` (no
-leptonica dep, only libtiff + Tesseract): the patch is a cmake-min flag, `<climits>`,
-`-ansi`→`-std=c++17`, forcing the modern-API `#define`, and `TesseractRect`→`SetImage`
-+`GetUTF8Text`. **Build + link + run verified; OCR-output correctness NOT yet verified**
-(couldn't synthesize a real VobSub offline — ffmpeg can't encode text→bitmap subs). The
-patched binary is installed to `~/.local/bin`; `install-linux.sh` reproduces the patched
-build. Missing tool → auto frames→vision fallback.
+**OCR toolchain — solved, but a patch to carry.** VobSub OCR uses a **patched
+`vobsub2srt`**. Two dead ends first: upstream `vobsub2srt` won't build on Tesseract 5
+(removed API), and `vobsubocr` (Rust) won't build on leptonica 1.86 (its bindings lag).
+`vobsub2srt` won because it has **no leptonica dep** (only libtiff + Tesseract). The
+patch (5 changes, all scripted in `install-linux.sh`): `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`,
+add `#include <climits>`, CMakeLists `-ansi -pedantic`→`-std=c++17`, add
+`#define CONFIG_TESSERACT_NAMESPACE 1` (forces the modern instance-API branch), and
+`TessBaseAPI::TesseractRect(image,1,stride,0,0,w,h)` → `SetImage(image,w,h,1,stride)`
++ `GetUTF8Text()`. **Build + link + run verified**; the patched binary is at
+`~/.local/bin/vobsub2srt`. ffprobe/ffmpeg/mkvextract were smoke-tested against a
+synthesized MKV (track detect + frame grab + graceful degradation all work). Missing
+tool ⇒ auto frames→vision fallback.
+
+**The one unverified thing:** OCR-*output* correctness. Couldn't synthesize a real
+VobSub `.idx/.sub` offline (ffmpeg refuses text→bitmap sub encoding; no VobSub generator
+packaged), so the `SetImage`/`GetUTF8Text` port is faithful-but-unproven end to end.
+The real test is the first disc rip (see below).
 
 ## What's next
 
@@ -100,10 +107,27 @@ build. Missing tool → auto frames→vision fallback.
 - **Phase 4 — rollout**: keep the legacy `reverse=True` path behind a fallback
   until content-ID is proven on several discs; merge the branch.
 
-## Try Phase 1 on the next disc
+## Try it on the next disc
 
+**Phase 2 (content-based, the scramble fix) — needs the patched `vobsub2srt` on PATH:**
+```
+python ripper.py --content-id --show "The Office" --season 1
+```
+Watch the logs for `Content-ID: title #N → The.Office.S01E0X.mkv (subtitles, confidence …)`.
+`method=subtitles` means OCR matching ran; `method=frames` means it fell back to vision.
+This is the disc that finally proves OCR output correctness end to end.
+
+**Phase 1 only (provider-aware numbering, no content-ID):**
 ```
 python ripper.py --season 1 --disc 1 --show "The Office"
 ```
+If the Jellyfin lookup fails, either command logs a warning and names the disc the old way.
 
-If the Jellyfin lookup fails it logs a warning and names the disc the old way.
+## Handy pointers for the next session
+
+- Patched vobsub2srt source lived in the scratchpad this session; `install-linux.sh`
+  rebuilds it from scratch (clone + scripted patch + `sudo make install`). The already-
+  built binary is in `~/.local/bin/`.
+- `sudo`/interactive installs can't run from the agent here (sudo needs a terminal) —
+  ask the user to run them via the `!` prefix.
+- Everything is **uncommitted** on `phase1-provider-aware-episodes` as of this handoff.
