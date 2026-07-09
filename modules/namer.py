@@ -62,8 +62,35 @@ def _scope_existing(existing: List[str], volume_name: str, season: int) -> List[
     return scoped
 
 
+def _episode_guide_section(episode_guide: List[Dict], season: int = None) -> str:
+    """Render the authoritative Jellyfin episode list into a prompt section that
+    constrains the model to real episode numbers and blocks invented ranges."""
+    if not episode_guide:
+        return ""
+    lines = []
+    for e in episode_guide:
+        rng = f"E{e['index']:02d}" + (f"-E{e['index_end']:02d}" if e.get("index_end") else "")
+        nm = f' "{e["name"]}"' if e.get("name") else ""
+        dur = f" (~{round(e['runtime_secs'] / 60)} min)" if e.get("runtime_secs") else ""
+        lines.append(f"  {rng}{nm}{dur}")
+    season_lbl = f"Season {season}" if season is not None else "this season"
+    return (
+        f"\nAUTHORITATIVE EPISODE LIST for {season_lbl} (from Jellyfin — these are the ONLY "
+        f"episodes that exist for this season):\n"
+        + "\n".join(lines)
+        + "\nRules using this list:\n"
+        "- NEVER assign an episode number that is not in this list. If the list ends at E06 there "
+        "is no E07/E08 — a leftover long title is a 'Play All'/compilation title, not a new episode.\n"
+        "- Only name a title as a hyphenated double range (e.g. S01E05-E06) if a listed episode above "
+        "shows a spanning range. If NO listed episode spans two numbers, a ~double-length title is a "
+        "'Play All' compilation, NOT two episodes — do not invent a range for it.\n"
+        "- Match each ripped title to one listed episode using its duration and the playback order.\n"
+    )
+
+
 def _build_prompt(volume_name: str, titles: List[Dict], existing_episodes: List[str] = None,
-                  season: int = None, disc: int = None) -> str:
+                  season: int = None, disc: int = None, show: str = None,
+                  episode_guide: List[Dict] = None) -> str:
     title_list = [
         {
             "index": t["title_index"],
@@ -103,13 +130,37 @@ def _build_prompt(volume_name: str, titles: List[Dict], existing_episodes: List[
             "Do NOT carry a running count over from an earlier season.\n"
         )
 
+    show_section = ""
+    if show:
+        show_section = (
+            f"\nShow (authoritative — this IS the show; use this exact name and ignore the "
+            f"volume label for the show name): {show}\n"
+        )
+
+    guide_section = _episode_guide_section(episode_guide, season)
+
+    # The generic "double length -> two episode numbers" heuristic is WRONG for providers
+    # (like TMDB) that count a feature-length episode as a single number, and it invents
+    # phantom episodes on 'Play All' titles. When we have the real episode list from Jellyfin,
+    # that list governs instead (see _episode_guide_section), so drop this heuristic entirely.
+    double_section = "" if episode_guide else """
+IMPORTANT for double-length / two-part episodes:
+- A single title whose duration is roughly DOUBLE the typical episode length on this disc (e.g. ~44+ min when the
+  other episodes run ~22 min) is almost always a special that aired as one feature-length episode but that episode
+  databases (TheTVDB, which Jellyfin matches against) count as TWO consecutive episode numbers (e.g. Friends Season 2
+  "The One After the Super Bowl" is one file but is episodes 12 AND 13).
+- Name that single file with a COMBINED episode range so Jellyfin maps the one file onto both slots:
+  Show.Name.S02E12-E13.mkv (one file, hyphenated range, both numbers zero-padded).
+- Such a title CONSUMES BOTH episode numbers. Continue numbering the following titles after the END of the range
+  (e.g. after S02E12-E13 the next title is S02E14, NOT S02E13). Getting this wrong shifts every later episode."""
+
     return f"""You are identifying content from a DVD/Blu-ray disc for Jellyfin media server organization.
 
 Disc volume label: {volume_name}
-{override_section}
+{show_section}{override_section}
 Titles on disc:
 {json.dumps(title_list, indent=2)}
-{existing_section}
+{existing_section}{guide_section}
 
 For each title, determine what movie or TV show episode it contains and return the correct Jellyfin-compatible filename.
 
@@ -133,16 +184,7 @@ IMPORTANT for movie discs (bonus content):
   version is the extra — keep only ONE as the main feature.
 - Use duration and the title filename as clues. This flag applies to MOVIES ONLY.
 - For TV episodes, ALWAYS set "is_extra": false. Every episode is real content that must be kept.
-
-IMPORTANT for double-length / two-part episodes:
-- A single title whose duration is roughly DOUBLE the typical episode length on this disc (e.g. ~44+ min when the
-  other episodes run ~22 min) is almost always a special that aired as one feature-length episode but that episode
-  databases (TheTVDB, which Jellyfin matches against) count as TWO consecutive episode numbers (e.g. Friends Season 2
-  "The One After the Super Bowl" is one file but is episodes 12 AND 13).
-- Name that single file with a COMBINED episode range so Jellyfin maps the one file onto both slots:
-  Show.Name.S02E12-E13.mkv (one file, hyphenated range, both numbers zero-padded).
-- Such a title CONSUMES BOTH episode numbers. Continue numbering the following titles after the END of the range
-  (e.g. after S02E12-E13 the next title is S02E14, NOT S02E13). Getting this wrong shifts every later episode.
+{double_section}
 
 Return ONLY a valid JSON array with no other text, markdown, or explanation:
 [
@@ -168,16 +210,21 @@ def _strip_fences(text: str) -> str:
 
 
 def identify(volume_name: str, titles: List[Dict], api_key: str, existing_episodes: List[str] = None,
-             season: int = None, disc: int = None) -> List[Dict]:
+             season: int = None, disc: int = None, show: str = None,
+             episode_guide: List[Dict] = None) -> List[Dict]:
     """
     Call Anthropic API to identify titles and generate Jellyfin-compatible filenames.
     Returns original title dicts merged with naming fields.
     When `season` is given it is authoritative — the model uses it verbatim instead of
     inferring the season from the (possibly season-less) volume label.
+    When `show` is given it is the authoritative show name (overrides the volume label).
+    When `episode_guide` is given (the real Jellyfin episode list) it constrains the model
+    to real episode numbers and disables the phantom-generating double-length heuristic.
     Raises NamerError if JSON parsing fails after one retry.
     """
     client = anthropic.Anthropic(api_key=api_key)
-    prompt = _build_prompt(volume_name, titles, existing_episodes, season=season, disc=disc)
+    prompt = _build_prompt(volume_name, titles, existing_episodes, season=season, disc=disc,
+                           show=show, episode_guide=episode_guide)
 
     messages = [{"role": "user", "content": prompt}]
 
