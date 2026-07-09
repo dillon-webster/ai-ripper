@@ -7,7 +7,7 @@ import anthropic
 
 log = logging.getLogger(__name__)
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-opus-4-8"
 
 
 class NamerError(Exception):

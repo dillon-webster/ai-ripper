@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from config import load_config
-from modules import disc_watcher, episode_guide, namer, notifier, transfer
+from modules import disc_watcher, episode_guide, identify, namer, notifier, transfer
 from modules import ripper as disc_ripper
 from modules.episode_guide import EpisodeGuideError
 from modules.namer import NamerError
@@ -38,7 +38,28 @@ def eject_disc(volume_path: Path) -> None:
     log.info("Disc ejected")
 
 
-def main(season: int = None, disc: int = None, show: str = None) -> None:
+def name_by_content(titles, guide, show, season, config):
+    """Content-based naming (Phase 2): identify each title from its subtitles/frames,
+    reconcile onto the real episode list, and drop Play-All/bonus titles. Returns the
+    transfer-ready named titles, or None if it couldn't keep anything (caller falls
+    back to the legacy playback-order namer rather than transfer nothing)."""
+    identified = [identify.identify_title(t, guide, config) for t in titles]
+    result = identify.reconcile(identified)
+    for d in result["dropped"]:
+        log.info(f"Content-ID dropped title #{d['title_index']} ({d.get('method')}): {d['drop_reason']}")
+    if not result["kept"]:
+        log.warning("Content-ID matched no episodes on this disc — falling back to legacy namer")
+        return None
+    named = [identify.build_named_title(t, show, season) for t in result["kept"]]
+    for t in named:
+        log.info(
+            f"Content-ID: title #{t['title_index']} → {t['jellyfin_filename']} "
+            f"({t.get('method')}, confidence {t.get('confidence', 0):.2f})"
+        )
+    return named
+
+
+def main(season: int = None, disc: int = None, show: str = None, content_id: bool = False) -> None:
     config = load_config()
     log.info("DVD Auto-Ripper started. Waiting for disc...")
     if season is not None:
@@ -80,15 +101,25 @@ def main(season: int = None, disc: int = None, show: str = None) -> None:
                 except EpisodeGuideError as e:
                     log.warning(f"Episode guide lookup failed ({e}); naming without it")
 
-            # reverse=True is INTENTIONAL and verified — do NOT change without testing
-            # on a real disc. Passing titles ascending produced reversed episode numbers
-            # (the bug fixed in commit 82e8601); descending is what names them correctly.
-            titles_ordered = sorted(titles, key=lambda t: t["title_index"], reverse=True)
-            named = namer.identify(
-                volume_name, titles_ordered, config.anthropic_api_key,
-                existing_episodes=existing, season=season, disc=disc,
-                show=show, episode_guide=guide,
-            )
+            # Content-based identification (Phase 2) is the real fix for scrambled disc
+            # order: it names each title by what it CONTAINS, not by playback position.
+            # Opt-in via --content-id during rollout (it's unproven vs. the legacy namer)
+            # and only when we have the guide + show + season to match against. If it
+            # can't keep anything, fall through to the legacy playback-order namer.
+            named = None
+            if content_id and guide and show and season is not None:
+                named = name_by_content(titles, guide, show, season, config)
+
+            if named is None:
+                # reverse=True is INTENTIONAL and verified — do NOT change without testing
+                # on a real disc. Passing titles ascending produced reversed episode numbers
+                # (the bug fixed in commit 82e8601); descending is what names them correctly.
+                titles_ordered = sorted(titles, key=lambda t: t["title_index"], reverse=True)
+                named = namer.identify(
+                    volume_name, titles_ordered, config.anthropic_api_key,
+                    existing_episodes=existing, season=season, disc=disc,
+                    show=show, episode_guide=guide,
+                )
             log.info(f"Named {len(named)} title(s)")
 
             # Drop non-episode content so only real episodes/features transfer:
@@ -145,5 +176,12 @@ if __name__ == "__main__":
              "provider-aware episode list so numbering is constrained to real episodes. "
              "Requires --season. Overrides the show name inferred from the disc label.",
     )
+    parser.add_argument(
+        "--content-id", action="store_true",
+        help="Identify each title by its CONTENT (subtitles→OCR, frames→vision) and match "
+             "it to the real episode list, instead of trusting makemkv playback order. Fixes "
+             "scrambled discs. Requires --show and --season; falls back to the legacy namer "
+             "if it can't confidently match.",
+    )
     args = parser.parse_args()
-    main(season=args.season, disc=args.disc, show=args.show)
+    main(season=args.season, disc=args.disc, show=args.show, content_id=args.content_id)

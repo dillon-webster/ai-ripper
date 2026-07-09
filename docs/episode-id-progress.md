@@ -50,13 +50,50 @@ Phase 1 does **not** fix scrambled order. When every episode runs ~22 min there'
 no duration signal, so the model still numbers by playback order. Ordering is
 fixed in Phase 2.
 
+## Phase 2 — content-based identification (module built, not yet wired)
+
+`modules/identify.py` exists on this branch (`test_identify.py`, 20 tests; 86 total pass):
+
+- `identify_title(title, candidates, config)` — tries the subtitle path first
+  (ffprobe finds the track → mkvextract pulls VobSub → vobsubocr/tesseract OCR →
+  first ~2 min of dialogue → `claude-opus-4-8` matches it against the Phase-1
+  candidate list), falls back to frames→vision (~3 frames via ffmpeg, skipping the
+  15–50s title montage) when subs are missing/ambiguous. Returns `episode=None`
+  when nothing matches (bonus/compilation) — never a forced guess.
+- Out-of-list episode numbers from the model are clamped to `None`, so a title can
+  never be numbered as an episode the season doesn't have.
+- `reconcile(identified)` maps identities onto real numbers: drops unmatched titles
+  (bonus), and when several titles claim one episode keeps the shortest (real) and
+  drops the longer 'Play All' omnibus copies. Nothing is deleted from disk — drops
+  are surfaced for the Phase-3 approval step.
+- Model note: `identify.py` uses `claude-opus-4-8` (current default). `namer.py`
+  still pins the older `claude-sonnet-4-6` — left unchanged for now.
+
+**Wired into `ripper.py::main` (2026-07-09), opt-in behind `--content-id`.** When
+`--content-id --show "X" --season N` is passed and the guide resolves, `name_by_content`
+runs `identify_title` per title → `reconcile` → `build_named_title`, bypassing the
+legacy `sorted(reverse=True)` playback-order namer. Falls back to the legacy namer if
+content-ID keeps nothing (never transfers nothing). `namer.py` model bumped to
+`claude-opus-4-8` too. 91 tests pass (`test_ripper_main.py` covers the content-ID path
++ the fallback).
+
+**Still TODO for Phase 2:** verify OCR output on a real disc. ffprobe/ffmpeg/mkvextract
+were smoke-tested against a synthesized MKV (track detection + frame grab + degradation
+work). **VobSub OCR uses a patched `vobsub2srt`.** History: upstream `vobsub2srt` won't
+build on Tesseract 5 (removed API); tried `vobsubocr` (Rust) instead — its leptonica
+bindings won't build on leptonica 1.86 either. Landed on patching `vobsub2srt` (no
+leptonica dep, only libtiff + Tesseract): the patch is a cmake-min flag, `<climits>`,
+`-ansi`→`-std=c++17`, forcing the modern-API `#define`, and `TesseractRect`→`SetImage`
++`GetUTF8Text`. **Build + link + run verified; OCR-output correctness NOT yet verified**
+(couldn't synthesize a real VobSub offline — ffmpeg can't encode text→bitmap subs). The
+patched binary is installed to `~/.local/bin`; `install-linux.sh` reproduces the patched
+build. Missing tool → auto frames→vision fallback.
+
 ## What's next
 
-- **Phase 2 — content-based identification** (`modules/identify.py`):
-  extract the first ~2 min of the subtitle track → OCR (tesseract / vobsub2srt)
-  → LLM-match against the candidate episode list; frames→vision fallback when a
-  disc has no usable subs. Reconcile rules separate real episode / Play-All
-  duplicate / genuine double / bonus feature. This is what fixes the scramble.
+- **Verify `--content-id` on a real disc** — install the toolchain, run
+  `python ripper.py --content-id --show "The Office" --season 1`, confirm a scrambled
+  disc comes out correctly numbered. This is the real proof the scramble is fixed.
 - **Phase 3 — Discord approval pipeline** (`modules/approval.py`): webhook → bot,
   post mapping + thumbnails + Approve/Fix buttons, blocking wait, transfer on
   approve. New deps: `discord.py`; new env: `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`.

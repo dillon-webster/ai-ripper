@@ -99,6 +99,83 @@ def test_main_loop_drops_movie_extras_before_transfer(tmp_path):
     )
 
 
+def test_main_loop_uses_content_id_when_enabled(tmp_path):
+    """With --content-id, naming comes from identify.name_by_content (guide-matched),
+    not the legacy playback-order namer."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [
+        {"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0},
+        {"path": disc_path / "title_t01.mkv", "duration_secs": 1320, "title_index": 1},
+    ]
+    guide = [
+        {"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404},
+        {"index": 2, "index_end": None, "name": "Diversity Day", "runtime_secs": 1332},
+    ]
+    # Content-ID resolves them E01/E02 regardless of disc order.
+    identified = [
+        {**raw_titles[0], "episode": 1, "index_end": None, "confidence": 0.9, "method": "frames"},
+        {**raw_titles[1], "episode": 2, "index_end": None, "confidence": 0.9, "method": "frames"},
+    ]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.namer.identify") as mock_namer, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]) as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord") as mock_discord, \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office", content_id=True)
+
+    mock_namer.assert_not_called()  # legacy namer bypassed
+    sent = mock_send.call_args[0][0]
+    assert [t["jellyfin_filename"] for t in sent] == ["The.Office.S01E01.mkv", "The.Office.S01E02.mkv"]
+
+
+def test_main_loop_content_id_falls_back_to_namer_when_nothing_matches(tmp_path):
+    """If content-ID keeps nothing (all unmatched), fall back to the legacy namer
+    rather than transfer nothing."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    named_titles = _make_named_titles(tmp_path)
+    unmatched = [{**raw_titles[0], "episode": None, "index_end": None, "confidence": 0.0, "method": "none"}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=unmatched), \
+         patch("ripper.namer.identify", return_value=named_titles) as mock_namer, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]) as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office", content_id=True)
+
+    mock_namer.assert_called_once()  # fell back to legacy naming
+    sent = mock_send.call_args[0][0]
+    assert [t["jellyfin_filename"] for t in sent] == ["Friends.S01E01.mkv"]
+
+
 def test_main_loop_sends_failure_discord_on_rip_error(tmp_path):
     from modules.ripper import RipError
     config = _make_config(tmp_path)
