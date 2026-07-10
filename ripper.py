@@ -46,8 +46,33 @@ def name_by_content(titles, guide, show, season, config):
     `named` is None if nothing could be kept, so the caller falls back to the legacy
     playback-order namer rather than transfer nothing."""
     guide_names = {e["index"]: e.get("name") for e in guide}
-    identified = [identify.identify_title(t, guide, config) for t in titles]
-    result = identify.reconcile(identified)
+    guide_runtimes = {e["index"]: e.get("runtime_secs") for e in guide if e.get("runtime_secs")}
+
+    # Pre-filter obvious 'Play All'/omnibus titles by length BEFORE the (slow) OCR:
+    # a title longer than the season's longest real episode can't BE a single episode,
+    # so skip identifying it (the 87-min half-disc compilation is also the slowest to
+    # OCR). reconcile still catches subtler omnibus (a 2-episode chunk that's under the
+    # cap but far longer than the episode it matched).
+    max_runtime = max(guide_runtimes.values(), default=0)
+    to_identify, omnibus = [], []
+    for t in titles:
+        dur = t.get("duration_secs", 0)
+        if max_runtime and dur > max_runtime * identify.OMNIBUS_RUNTIME_FACTOR:
+            omnibus.append(t)
+        else:
+            to_identify.append(t)
+    for t in omnibus:
+        log.info(f"Content-ID: skipping title #{t['title_index']} ({int(t.get('duration_secs', 0) // 60)} min) "
+                 "— longer than any episode, not OCR'd (Play-All/omnibus)")
+
+    identified = [identify.identify_title(t, guide, config) for t in to_identify]
+    result = identify.reconcile(identified, episode_runtimes=guide_runtimes)
+    for t in omnibus:
+        result["dropped"].append({
+            **t, "episode": None, "method": "skipped",
+            "drop_reason": f"Play-All/omnibus ({int(t.get('duration_secs', 0) // 60)} min — "
+                           "longer than any episode)",
+        })
     for d in result["dropped"]:
         log.info(f"Content-ID dropped title #{d['title_index']} ({d.get('method')}): {d['drop_reason']}")
     if not result["kept"]:

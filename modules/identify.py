@@ -57,6 +57,14 @@ SUBTITLE_HEAD_SKIP_SECS = 40       # never sample before this — skips recap/mo
 SUBTITLE_MAX_CHARS = 3500          # keep the OCR'd dialogue prompt bounded
 FRAME_TIMESTAMPS = (8, 300, 500)  # teaser, then two deep-plot beats past the montage
 
+# A ripped title running this many times longer than its matched episode's real
+# runtime is a 'Play All'/omnibus (it merely OPENS with that episode), not the
+# episode itself → dropped in reconcile. 1.5× clears normal length variance while
+# flagging 2-episode (~1.9×) and half-disc (~4×) compilations. Comparing against the
+# MATCHED episode's runtime (not a fixed single-episode length) keeps genuinely
+# double-length episodes, whose Jellyfin runtime is itself ~2×.
+OMNIBUS_RUNTIME_FACTOR = 1.5
+
 _SUBPROCESS_TIMEOUT = 300
 
 
@@ -375,26 +383,48 @@ def build_named_title(title: Dict, show: str, season: int) -> Dict:
     }
 
 
-def reconcile(identified: List[Dict]) -> Dict:
+def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -> Dict:
     """Map identified titles onto real episode numbers, dropping duplicates and bonuses.
+
+    `episode_runtimes` maps episode number → real runtime (secs), from the Jellyfin
+    guide; used to spot 'Play All'/omnibus titles by length. Optional: without it a
+    fallback single-episode length is derived from the matched titles' own durations.
 
     Returns {"kept": [...], "dropped": [...]}:
     - Unmatched titles (episode is None) → dropped as bonus/compilation.
-    - When several titles claim the SAME episode number, the one whose duration is
-      closest to a single episode is the real one; the longer ones are 'Play All'
-      omnibus titles → dropped.
+    - A title running >OMNIBUS_RUNTIME_FACTOR× its matched episode's real runtime is a
+      'Play All' omnibus (it just opens with that episode) → dropped, even if nothing
+      else claimed that number. This is what catches a compilation that content-matched
+      a distinct episode instead of colliding with the real single.
+    - When several titles still claim the SAME number, the shortest is the real episode;
+      the longer ones are dropped as omnibus copies.
     - Everything else is kept, annotated with its final episode/index_end.
 
     Nothing is deleted from disk here — callers surface the drops for approval
     (Phase 3) so a bad OCR that orphaned a real episode is caught, not lost.
     """
+    episode_runtimes = episode_runtimes or {}
+    # Fallback reference length when the guide has no runtime for a matched episode:
+    # the median of matched titles' durations (robust to a few long omnibus outliers).
+    matched_durs = sorted(t["duration_secs"] for t in identified
+                          if t.get("episode") is not None and t.get("duration_secs"))
+    median_dur = matched_durs[len(matched_durs) // 2] if matched_durs else None
+
     kept, dropped = [], []
     by_episode: Dict[int, List[Dict]] = {}
     for t in identified:
-        if t.get("episode") is None:
+        episode = t.get("episode")
+        if episode is None:
             dropped.append({**t, "drop_reason": "no matching episode (bonus/compilation)"})
-        else:
-            by_episode.setdefault(t["episode"], []).append(t)
+            continue
+        ref = episode_runtimes.get(episode) or median_dur
+        dur = t.get("duration_secs")
+        if ref and dur and dur > ref * OMNIBUS_RUNTIME_FACTOR:
+            dropped.append({**t, "drop_reason":
+                            f"Play-All/omnibus ({int(dur // 60)} min — "
+                            f"~{dur / ref:.1f}× episode length)"})
+            continue
+        by_episode.setdefault(episode, []).append(t)
 
     for episode, group in sorted(by_episode.items()):
         if len(group) == 1:
