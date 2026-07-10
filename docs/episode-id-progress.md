@@ -3,11 +3,15 @@
 _Last updated: 2026-07-09. Branch: `phase1-provider-aware-episodes` (commit `9152ede`, pushed)._
 _Full design: [episode-identification-plan.md](./episode-identification-plan.md)._
 
-**TL;DR for the next session:** Phases 1 & 2 are **done, committed, and pushed**. Content-ID
-was proven on a real scrambled disc (The Office S1 disc 1: 6/6 unscrambled, verified by eye).
-**Phase 3 (Discord approval gate) is now BUILT** (module + wiring + tests, 104 pass) but
-**not yet proven live** — it needs a one-time Discord bot setup by the user and a real-disc
-run. See "Phase 3 — built" below. Only Phase 4 (merge to main) remains.
+**TL;DR for the next session:** Phases 1, 2 & 3 are **done and PROVEN LIVE.** On 2026-07-09
+the full pipeline ran end-to-end on The Office **S2 disc 1**: TMDB guide (22 eps) → 3 Play-All
+omnibus dropped → E01–E06 matched on subtitles at 0.95–0.99 → approved from phone over Discord
+(with per-episode thumbnails) → transferred + Jellyfin scan. **115 tests pass.** Two things this
+run added that you MUST know: (a) the episode guide now comes from **TMDB** (needs `TMDB_API_KEY`
+in `.env`), because Jellyfin only knows already-ripped seasons — an empty guide was why a brand-new
+season fell back to the legacy namer; (b) reconcile now drops **Play-All/omnibus** titles by
+runtime. Remaining: two small follow-ups (held-notification + `--resume`, see "Follow-ups") then
+Phase 4 merge to `main`. Commits `9c2e2dd`→`2f43d0f` on `phase1-provider-aware-episodes`, not pushed.
 
 ## Why we're doing this
 
@@ -224,11 +228,45 @@ mid-session — check `git status`.
 3. **Prove it live** on a real disc: `python ripper.py --content-id --show "X" --season N
    --approve`. Confirm the embed renders, Approve transfers, Fix/timeout holds.
 
+## Follow-ups — quick wins for next session (2026-07-09)
+
+Both surfaced while proving Phase 3 live on The Office S2 disc 1. Small, independent,
+well-scoped; do either first. **Branch `phase1-provider-aware-episodes`; run tests with
+`./venv/bin/python -m pytest`.**
+
+### 1. Held ≠ failure — give holds their own Discord notification
+**Problem:** when you tap ✏️ Fix (or approval times out), `ripper.py::main`'s held branch calls
+`notifier.send_discord([], success=False, error=f"Held for manual handling: {reason}")`, which
+renders as `❌ Ripper failed: Held for manual handling…`. A deliberate hold reads as a crash.
+**Fix:** give holds a distinct message. Either add a `held`/`status` path to
+`notifier.send_discord`, or add `notifier.send_hold(reason, kept_count, temp_dir, config)` posting
+e.g. `⏸️ Rip held for manual handling — N file(s) kept in {temp_dir}, nothing transferred. Fix and
+re-run.` Call it from the held branch instead of `send_discord(success=False, …)`. Real failures
+(RipError/TransferError/NamerError) keep the ❌ path. **Touches:** `modules/notifier.py`,
+`ripper.py` (held branch, ~line 170), `tests/test_notifier.py`, and
+`tests/test_ripper_main.py::test_main_loop_approve_holds_files_when_declined` (currently asserts
+`send_discord` called with `success is False` — update to assert the new hold call).
+
+### 2. `--resume` — reuse the held rip, skip re-ripping
+**Problem:** after a Fix/hold or `--dry-run`, re-running re-rips AND re-OCRs the whole disc (~10+
+min). Tonight we worked around it with a one-off finisher script. Make it first-class.
+**Behavior:** `--resume` builds the `titles` list from the MKVs already in `TEMP_DIR` instead of
+calling `disc_ripper.rip` — for each `*.mkv`: `path`, `duration_secs` via ffprobe, `title_index`
+from the `_t(\d+)` in the name (reuse `modules.ripper._parse_title_index`). Then run the normal
+content-ID → reconcile → approval → transfer path. There's no disc to wait for, so `--resume`
+should SKIP `disc_watcher.wait_for_disc()` and do ONE pass then return (like `--dry-run`), not
+loop. On a later hold it must still keep temp/disc. **Working prototype:** the scratchpad finisher
+`finish_held_disc.py` (built exactly this — build titles from temp → `ripper.name_by_content` →
+`approval.request_approval` → on approve `transfer.send_all` + `notifier.trigger_jellyfin_scan`);
+port its title-building into a `titles_from_temp(temp_dir)` helper in `ripper.py`. Add tests
+mirroring the content-ID main tests but feeding titles from a temp dir.
+
 ## What's next — Phase 4 (rollout / merge)
 
 Legacy `reverse=True` path already stays as an auto-fallback when content-ID can't resolve.
-Once the Phase-3 gate is proven live (steps above) and a couple more discs are through it,
-merge `phase1-provider-aware-episodes` → `main`.
+Phase 3 is now **proven live** (The Office S2 disc 1: TMDB guide → 3 omnibus dropped → E01–E06
+matched on subtitles 0.95–0.99 → approved on phone → transferred + Jellyfin scan). After a couple
+more discs and the two follow-ups above, merge `phase1-provider-aware-episodes` → `main`.
 
 ## Try it on the next disc
 
