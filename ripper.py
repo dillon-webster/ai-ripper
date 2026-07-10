@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 
 from config import load_config
-from modules import disc_watcher, episode_guide, identify, namer, notifier, transfer
+from modules import approval, disc_watcher, episode_guide, identify, namer, notifier, transfer
 from modules import ripper as disc_ripper
 from modules.episode_guide import EpisodeGuideError
 from modules.namer import NamerError
@@ -40,27 +40,33 @@ def eject_disc(volume_path: Path) -> None:
 
 def name_by_content(titles, guide, show, season, config):
     """Content-based naming (Phase 2): identify each title from its subtitles/frames,
-    reconcile onto the real episode list, and drop Play-All/bonus titles. Returns the
-    transfer-ready named titles, or None if it couldn't keep anything (caller falls
-    back to the legacy playback-order namer rather than transfer nothing)."""
+    reconcile onto the real episode list, and drop Play-All/bonus titles. Returns
+    (named, dropped): the transfer-ready named titles annotated with their episode
+    name (for the approval message), and the dropped titles with their reasons.
+    `named` is None if nothing could be kept, so the caller falls back to the legacy
+    playback-order namer rather than transfer nothing."""
+    guide_names = {e["index"]: e.get("name") for e in guide}
     identified = [identify.identify_title(t, guide, config) for t in titles]
     result = identify.reconcile(identified)
     for d in result["dropped"]:
         log.info(f"Content-ID dropped title #{d['title_index']} ({d.get('method')}): {d['drop_reason']}")
     if not result["kept"]:
         log.warning("Content-ID matched no episodes on this disc — falling back to legacy namer")
-        return None
-    named = [identify.build_named_title(t, show, season) for t in result["kept"]]
-    for t in named:
+        return None, result["dropped"]
+    named = []
+    for t in result["kept"]:
+        nt = identify.build_named_title(t, show, season)
+        nt["episode_name"] = guide_names.get(t["episode"])
+        named.append(nt)
         log.info(
-            f"Content-ID: title #{t['title_index']} → {t['jellyfin_filename']} "
-            f"({t.get('method')}, confidence {t.get('confidence', 0):.2f})"
+            f"Content-ID: title #{nt['title_index']} → {nt['jellyfin_filename']} "
+            f"({nt.get('method')}, confidence {nt.get('confidence', 0):.2f})"
         )
-    return named
+    return named, result["dropped"]
 
 
 def main(season: int = None, disc: int = None, show: str = None,
-         content_id: bool = False, dry_run: bool = False) -> None:
+         content_id: bool = False, dry_run: bool = False, approve: bool = False) -> None:
     config = load_config()
     log.info("DVD Auto-Ripper started. Waiting for disc...")
     if season is not None:
@@ -75,6 +81,9 @@ def main(season: int = None, disc: int = None, show: str = None,
         volume_name, volume_path = disc_watcher.wait_for_disc()
         log.info(f"Disc detected: {volume_name} at {volume_path}")
 
+        # `held` (approval declined/timed out) keeps temp files + disc for manual
+        # handling, mirroring --dry-run. Reset per disc, read in the finally block.
+        held = False
         try:
             # Duration-based dedup is DISABLED: many box sets give every disc the
             # same volume label (e.g. "FRIENDS_SERIES_3"), so matching titles by
@@ -108,8 +117,9 @@ def main(season: int = None, disc: int = None, show: str = None,
             # and only when we have the guide + show + season to match against. If it
             # can't keep anything, fall through to the legacy playback-order namer.
             named = None
+            dropped = []  # titles content-ID/extras filtering won't transfer — shown for approval
             if content_id and guide and show and season is not None:
-                named = name_by_content(titles, guide, show, season, config)
+                named, dropped = name_by_content(titles, guide, show, season, config)
 
             if named is None:
                 # reverse=True is INTENTIONAL and verified — do NOT change without testing
@@ -134,13 +144,13 @@ def main(season: int = None, disc: int = None, show: str = None,
                 for t in named:
                     if t.get("is_extra"):
                         log.info(f"Skipping non-episode title: {t['jellyfin_filename']}")
+                        dropped.append({**t, "drop_reason": "non-episode extra"})
                 named = kept
 
             # --dry-run: propose the mapping and STOP before writing anything to the
-            # library. Until the Phase-3 approval gate exists, this is how a real disc
-            # (esp. a scrambled one) gets validated without auto-transferring a possibly
-            # wrong mapping. Ripped files are kept and the disc is left in the drive so a
-            # real transfer can follow without re-ripping. Drops are already logged above.
+            # library — and, unlike --approve, without even asking. Ripped files are kept
+            # and the disc is left in the drive so a real transfer can follow without
+            # re-ripping. Drops are already logged above.
             if dry_run:
                 log.info(f"DRY RUN — would transfer {len(named)} title(s) "
                          "(nothing written to Jellyfin):")
@@ -152,6 +162,21 @@ def main(season: int = None, disc: int = None, show: str = None,
                     log.info(f"  {src} → {t['jellyfin_filename']}{extra}")
                 log.info(f"DRY RUN — temp files kept in {config.temp_dir}; disc not ejected.")
                 return
+
+            # Phase 3 approval gate: a human confirms the mapping over Discord before
+            # it's written to the library. On decline/timeout/misconfig we HOLD (keep
+            # temp files + disc), never transfer a possibly-wrong mapping.
+            if approve:
+                decision = approval.request_approval(named, dropped, config)
+                if not decision.approved:
+                    log.warning(f"Rip held — {decision.reason}. "
+                                f"Files kept in {config.temp_dir}; fix and re-run.")
+                    notifier.send_discord(
+                        [], success=False,
+                        error=f"Held for manual handling: {decision.reason}", config=config)
+                    held = True
+                    continue
+                log.info(f"Approved — {decision.reason}. Transferring.")
 
             transfer.send_all(named, config)
             log.info("Transfer complete")
@@ -170,9 +195,9 @@ def main(season: int = None, disc: int = None, show: str = None,
             notifier.send_discord([], success=False, error=str(e), config=config)
 
         finally:
-            # Keep the rip + leave the disc in on a dry run so a real transfer can
-            # follow without re-ripping.
-            if not dry_run:
+            # Keep the rip + leave the disc in on a dry run OR a held approval so a
+            # real transfer can follow without re-ripping.
+            if not dry_run and not held:
                 cleanup_temp(config.temp_dir)
                 eject_disc(volume_path)
                 log.info("Ready for next disc.")
@@ -205,6 +230,13 @@ if __name__ == "__main__":
              "if it can't confidently match.",
     )
     parser.add_argument(
+        "--approve", action="store_true",
+        help="Post the proposed episode mapping to Discord and WAIT for a human to tap "
+             "Approve/Fix before transferring (Phase 3 gate). On Fix/timeout, or if the "
+             "bot isn't configured, files are held in TEMP_DIR and nothing is written. "
+             "Requires DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID. Ignored with --dry-run.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Rip and name the disc, print the proposed episode mapping, then STOP before "
              "transferring anything to Jellyfin. Ripped files are kept and the disc is left "
@@ -213,4 +245,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(season=args.season, disc=args.disc, show=args.show,
-         content_id=args.content_id, dry_run=args.dry_run)
+         content_id=args.content_id, dry_run=args.dry_run, approve=args.approve)

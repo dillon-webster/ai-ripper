@@ -210,6 +210,82 @@ def test_main_loop_dry_run_stops_before_transfer(tmp_path):
     mock_eject.assert_not_called()     # disc left in the drive
 
 
+def test_main_loop_approve_transfers_on_approval(tmp_path):
+    """--approve posts the mapping for approval; on Approve it transfers as normal."""
+    from modules.approval import Decision
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    identified = [{**raw_titles[0], "episode": 1, "index_end": None,
+                   "confidence": 0.98, "method": "subtitles"}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.approval.request_approval",
+               return_value=Decision(True, "approved by dillon")) as mock_approve, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]) as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp") as mock_cleanup, \
+         patch("ripper.eject_disc") as mock_eject:
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office", content_id=True, approve=True)
+
+    mock_approve.assert_called_once()
+    sent = mock_send.call_args[0][0]
+    assert [t["jellyfin_filename"] for t in sent] == ["The.Office.S01E01.mkv"]
+    mock_cleanup.assert_called_once()  # approved run cleans up + ejects normally
+    mock_eject.assert_called_once()
+
+
+def test_main_loop_approve_holds_files_when_declined(tmp_path):
+    """On Fix/timeout/misconfig the mapping must NOT transfer, and the rip + disc are
+    held (no cleanup, no eject) for manual handling."""
+    from modules.approval import Decision
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    identified = [{**raw_titles[0], "episode": 1, "index_end": None,
+                   "confidence": 0.98, "method": "subtitles"}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.approval.request_approval",
+               return_value=Decision(False, "approval timed out")), \
+         patch("ripper.transfer.send_all") as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan") as mock_scan, \
+         patch("ripper.notifier.send_discord") as mock_discord, \
+         patch("ripper.cleanup_temp") as mock_cleanup, \
+         patch("ripper.eject_disc") as mock_eject:
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office", content_id=True, approve=True)
+
+    mock_send.assert_not_called()     # nothing transferred
+    mock_scan.assert_not_called()     # no Jellyfin scan
+    mock_cleanup.assert_not_called()  # rip held for manual handling
+    mock_eject.assert_not_called()    # disc left in the drive
+    mock_discord.assert_called_once()  # posts a "held" failure notice
+    assert mock_discord.call_args.kwargs["success"] is False
+
+
 def test_main_loop_sends_failure_discord_on_rip_error(tmp_path):
     from modules.ripper import RipError
     config = _make_config(tmp_path)

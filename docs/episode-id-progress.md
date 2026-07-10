@@ -1,7 +1,13 @@
 # Episode identification rework — progress & next steps
 
-_Last updated: 2026-07-09. Branch: `phase1-provider-aware-episodes`._
+_Last updated: 2026-07-09. Branch: `phase1-provider-aware-episodes` (commit `9152ede`, pushed)._
 _Full design: [episode-identification-plan.md](./episode-identification-plan.md)._
+
+**TL;DR for the next session:** Phases 1 & 2 are **done, committed, and pushed**. Content-ID
+was proven on a real scrambled disc (The Office S1 disc 1: 6/6 unscrambled, verified by eye).
+**Phase 3 (Discord approval gate) is now BUILT** (module + wiring + tests, 104 pass) but
+**not yet proven live** — it needs a one-time Discord bot setup by the user and a real-disc
+run. See "Phase 3 — built" below. Only Phase 4 (merge to main) remains.
 
 ## Why we're doing this
 
@@ -169,16 +175,55 @@ This closes the last mock-only gap (rip→content-ID integration). The scramble 
 motivated the whole rewrite is fixed. Note: the OCR phase for 8 titles (incl. two long
 omnibus titles) took ~12 min — vobsub2srt OCRs the whole track; acceptable but a known cost.
 
-## What's next
+## Phase 3 — Discord approval gate (BUILT, not yet proven live) — 2026-07-09
 
-- ~~Verify `--content-id` on a real disc~~ **DONE 2026-07-09** — The Office S1 disc 1
-  unscrambled 6/6 + 2 correct Play-All drops (see section above). Still **no approval gate**,
-  so a plain `--content-id` run transfers straight to Jellyfin — use `--dry-run` until Phase 3.
-- **Phase 3 — Discord approval pipeline** (`modules/approval.py`): webhook → bot,
-  post mapping + thumbnails + Approve/Fix buttons, blocking wait, transfer on
-  approve. New deps: `discord.py`; new env: `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`.
-- **Phase 4 — rollout**: keep the legacy `reverse=True` path behind a fallback
-  until content-ID is proven on several discs; merge the branch.
+Replaces the `--dry-run` stopgap with a human gate so a disc transfers with one tap from
+your phone. **104 tests pass.** Code is committed on `phase1-provider-aware-episodes` (see
+git log for the exact hash). Still uncommitted at time of writing if you're reading this
+mid-session — check `git status`.
+
+- **New module `modules/approval.py`.** `request_approval(named, dropped, config) -> Decision`.
+  Uses a Discord **bot** (the one-way webhook can't receive taps). Posts an embed — the
+  proposed `title → SxxEyy — name [method, conf]` mapping plus the dropped (Play-All/bonus)
+  list with durations — and two buttons **✅ Approve / ✏️ Fix**. **Blocking** wait with a
+  long timeout (default 1800s, `APPROVAL_TIMEOUT_SECS`). Synchronous to the caller: it runs
+  its own asyncio loop, posts, blocks for the tap, tears down, returns.
+  - **Fails safe, never raises.** Bot not configured / gateway or login failure / Fix tap /
+    timeout all return `Decision(approved=False)` → the caller HOLDS the files. Only an
+    explicit Approve returns `approved=True`.
+  - `discord.py` is **lazy-imported inside the function**, so the rest of the pipeline and the
+    whole test suite import fine without it installed. Pure formatting helpers
+    (`format_mapping/format_dropped/format_proposal`) are unit-tested with no discord dep.
+- **Config/env:** `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`, `APPROVAL_TIMEOUT_SECS` (all
+  optional, blank ⇒ gate can't run and holds). Added to `config.py` + `.env.example`. New dep
+  `discord.py` in `requirements.txt` (**not yet installed on the rip box — `pip install` it**).
+- **Wiring (`ripper.py::main`, behind new `--approve` flag):** slots in right after the
+  `--dry-run` return and before `transfer.send_all`. On Approve → transfer + Jellyfin scan +
+  success webhook as before. On decline/timeout → `held=True`: skip transfer, keep temp files
+  **and** leave the disc in the drive (same as `--dry-run`, via `if not dry_run and not held`
+  in the `finally`), post a "Held for manual handling" webhook, `continue` to the next disc.
+  `--dry-run` takes precedence (propose + stop, never even asks). `name_by_content` now returns
+  `(named, dropped)` and annotates each named title with its `episode_name` for the embed.
+- **Chose an explicit `--approve` flag** rather than making approval the default for
+  `--content-id` (the plan floated that): explicit is non-breaking and predictable; recommended
+  invocation is now `--content-id --approve`. Easy to flip to default later if desired.
+
+### Phase 3 — what's left before it's done
+1. **User: create the Discord bot (one-time).** Discord Developer Portal → New Application →
+   Bot tab → Add Bot → **Reset Token** and copy it → OAuth2 → URL Generator → scope `bot`,
+   permissions **Send Messages + Embed Links** → open the URL, invite it to your server. Get
+   the channel id: Discord Settings → Advanced → **Developer Mode** on → right-click the target
+   channel → **Copy Channel ID**. Put both in `.env` (`DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`).
+   Message Content intent is **not** needed (buttons come over the gateway regardless).
+2. **User: `pip install discord.py`** into the rip box venv (it's in requirements now).
+3. **Prove it live** on a real disc: `python ripper.py --content-id --show "X" --season N
+   --approve`. Confirm the embed renders, Approve transfers, Fix/timeout holds.
+
+## What's next — Phase 4 (rollout / merge)
+
+Legacy `reverse=True` path already stays as an auto-fallback when content-ID can't resolve.
+Once the Phase-3 gate is proven live (steps above) and a couple more discs are through it,
+merge `phase1-provider-aware-episodes` → `main`.
 
 ## Try it on the next disc
 
@@ -206,4 +251,15 @@ If the Jellyfin lookup fails, either command logs a warning and names the disc t
   built binary is in `~/.local/bin/`.
 - `sudo`/interactive installs can't run from the agent here (sudo needs a terminal) —
   ask the user to run them via the `!` prefix.
-- Everything is **uncommitted** on `phase1-provider-aware-episodes` as of this handoff.
+- Phase 2 is **committed + pushed** (`9152ede`) on `phase1-provider-aware-episodes`. 96 tests pass.
+- The verification rip (8 MKVs of The Office S1 disc 1) was watched, confirmed correct, and
+  **deleted** from `/var/tmp/ai-ripper` — temp dir is clean.
+- `dillon-pc` is the rip box: makemkvcon + ffmpeg/ffprobe/mkvextract/tesseract + patched
+  `vobsub2srt` (`~/.local/bin`) + `mpv` all installed. Optical drive is `/dev/sr0`; udisks2
+  mounts discs under `/run/media/$USER/<LABEL>`.
+- **Gotcha for a live re-test:** `disc_watcher.wait_for_disc()` only fires on *insertion* — it
+  seeds itself with discs already mounted at startup. If a disc is already in the drive when
+  you launch, eject+reinsert after starting, or drive the pipeline directly.
+- **Don't delete a show's season from Jellyfin to "test from scratch":** `episode_guide` pulls
+  the episode list (the match key) *from* Jellyfin, so removing it makes content-ID fall back
+  to the scrambled legacy namer.

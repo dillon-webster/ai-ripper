@@ -15,6 +15,12 @@ class Config:
     discord_webhook_url: str
     temp_dir: Path
     media_root: str
+    # Phase 3 (Discord approval gate) — optional; blank ⇒ the --approve gate can't
+    # run and holds files instead of transferring. The one-way webhook above stays
+    # for success/failure notifications.
+    discord_bot_token: str = ""
+    discord_channel_id: str = ""
+    approval_timeout_secs: int = 1800
 
 
 def load_config() -> Config:
@@ -43,4 +49,7 @@ def load_config() -> Config:
         discord_webhook_url=os.environ["DISCORD_WEBHOOK_URL"],
         temp_dir=Path(os.environ["TEMP_DIR"]),
         media_root=os.environ["MEDIA_ROOT"],
+        discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", ""),
+        discord_channel_id=os.getenv("DISCORD_CHANNEL_ID", ""),
+        approval_timeout_secs=int(os.getenv("APPROVAL_TIMEOUT_SECS", "1800")),
     )
