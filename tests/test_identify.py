@@ -54,6 +54,20 @@ def test_candidate_lines_render_spanning_range():
     assert "E12-E13" in lines
 
 
+def test_candidate_lines_include_overview_when_present():
+    lines = _candidate_lines([
+        {"index": 11, "index_end": None, "name": "The Stripper Cries", "runtime_secs": 1800,
+         "overview": "Joey competes on The $100,000 Pyramid; a stripper cries at the party."},
+    ])
+    assert "Pyramid" in lines  # the plot summary the model matches dialogue against
+
+
+def test_candidate_lines_omit_overview_line_when_absent():
+    # No overview → no extra line, no crash.
+    lines = _candidate_lines([{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}])
+    assert lines.strip().count("\n") == 0
+
+
 def test_subtitle_prompt_includes_dialogue_and_choices():
     prompt = _build_subtitle_prompt("Michael: that's what she said", CANDIDATES)
     assert "that's what she said" in prompt
@@ -107,21 +121,26 @@ def test_parse_match_raises_on_garbage():
 
 # --- SRT dialogue extraction -----------------------------------------------
 
-def test_srt_dialogue_keeps_only_opening_window():
+def test_srt_dialogue_samples_across_runtime_skipping_opening():
+    # span = 600s (last cue). Sample windows land at ~180-225s and ~480-525s, so the
+    # distinctive middle/late lines are captured and the shared opening is skipped —
+    # the fix for serialized-arc episodes that all open the same way.
     srt = (
-        "1\n00:00:05,000 --> 00:00:08,000\nHello there\n\n"
-        "2\n00:01:30,000 --> 00:01:33,000\nStill early\n\n"
-        "3\n00:05:00,000 --> 00:05:03,000\nToo late\n"
+        "1\n00:00:05,000 --> 00:00:08,000\nShared opening chatter\n\n"
+        "2\n00:03:25,000 --> 00:03:28,000\nDistinctive middle\n\n"
+        "3\n00:08:15,000 --> 00:08:18,000\nDistinctive late\n\n"
+        "4\n00:10:00,000 --> 00:10:03,000\nFinal beat\n"
     )
-    text = _srt_dialogue(srt, max_secs=120)
-    assert "Hello there" in text
-    assert "Still early" in text
-    assert "Too late" not in text
+    text = _srt_dialogue(srt)
+    assert "Distinctive middle" in text
+    assert "Distinctive late" in text
+    assert "Shared opening chatter" not in text
 
 
-def test_srt_dialogue_strips_indices_and_blanks():
+def test_srt_dialogue_uses_whole_short_track():
+    # Too short to spread → all dialogue is used, indices/blank lines stripped.
     srt = "1\n00:00:01,000 --> 00:00:04,000\nLine one\nLine two\n"
-    assert _srt_dialogue(srt, 120) == "Line one Line two"
+    assert _srt_dialogue(srt) == "Line one Line two"
 
 
 # --- reconcile rules --------------------------------------------------------
@@ -234,6 +253,44 @@ def test_identify_title_falls_back_when_subtitles_dont_match(tmp_path):
 
     assert result["episode"] == 3
     assert result["method"] == "frames"
+
+
+def test_identify_title_falls_back_to_frames_on_malformed_subtitle_json(tmp_path):
+    # A malformed model reply on the subtitle match must not crash the rip — it
+    # degrades to frames. Regression for the IdentifyError that killed a season run.
+    mkv = tmp_path / "title_t00.mkv"
+    mkv.write_bytes(b"")
+    title = {"path": mkv, "duration_secs": 1320, "title_index": 0}
+    frame = tmp_path / "frame_0.jpg"
+    frame.write_bytes(b"\xff\xd8\xff")
+
+    responses = iter([
+        _mock_anthropic("not json at all"),                       # subtitle match → IdentifyError
+        _mock_anthropic('{"episode": 3, "confidence": 0.8}'),     # frame match recovers
+    ])
+    with patch.object(identify, "extract_subtitle_text", return_value="some dialogue"), \
+         patch.object(identify, "extract_frames", return_value=[frame]), \
+         patch("modules.identify.anthropic.Anthropic", side_effect=lambda **k: next(responses)):
+        result = identify_title(title, CANDIDATES, CONFIG)
+
+    assert result["episode"] == 3
+    assert result["method"] == "frames"
+
+
+def test_identify_title_returns_none_when_both_matches_malformed(tmp_path):
+    mkv = tmp_path / "title_t00.mkv"
+    mkv.write_bytes(b"")
+    title = {"path": mkv, "duration_secs": 1320, "title_index": 0}
+    frame = tmp_path / "frame_0.jpg"
+    frame.write_bytes(b"\xff\xd8\xff")
+
+    with patch.object(identify, "extract_subtitle_text", return_value="dialogue"), \
+         patch.object(identify, "extract_frames", return_value=[frame]), \
+         patch("modules.identify.anthropic.Anthropic", return_value=_mock_anthropic("garbage")):
+        result = identify_title(title, CANDIDATES, CONFIG)
+
+    assert result["episode"] is None
+    assert result["method"] == "none"
 
 
 def test_identify_title_returns_none_when_no_signal(tmp_path):

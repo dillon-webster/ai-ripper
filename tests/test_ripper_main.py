@@ -176,6 +176,40 @@ def test_main_loop_content_id_falls_back_to_namer_when_nothing_matches(tmp_path)
     assert [t["jellyfin_filename"] for t in sent] == ["Friends.S01E01.mkv"]
 
 
+def test_main_loop_dry_run_stops_before_transfer(tmp_path):
+    """--dry-run rips + names but must not transfer, scan, eject, or delete the rip;
+    it returns after one disc instead of looping."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    identified = [{**raw_titles[0], "episode": 1, "index_end": None,
+                   "confidence": 0.9, "method": "subtitles"}]
+
+    # No StopIteration needed: dry-run returns after the single disc.
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc", return_value=("THE_OFFICE_DISC1", disc_path)), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.transfer.send_all") as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan") as mock_scan, \
+         patch("ripper.notifier.send_discord") as mock_discord, \
+         patch("ripper.cleanup_temp") as mock_cleanup, \
+         patch("ripper.eject_disc") as mock_eject:
+        import ripper
+        ripper.main(season=1, show="The Office", content_id=True, dry_run=True)
+
+    mock_send.assert_not_called()      # nothing transferred
+    mock_scan.assert_not_called()      # no Jellyfin scan
+    mock_discord.assert_not_called()   # no success ping
+    mock_cleanup.assert_not_called()   # rip kept for a later real transfer
+    mock_eject.assert_not_called()     # disc left in the drive
+
+
 def test_main_loop_sends_failure_discord_on_rip_error(tmp_path):
     from modules.ripper import RipError
     config = _make_config(tmp_path)

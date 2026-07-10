@@ -64,7 +64,11 @@ def find_series_id(show_name: str, config) -> Optional[str]:
 
 def get_season_episodes(show_name: str, season: int, config) -> List[Dict]:
     """Return the real episode list for `show_name` season `season` from Jellyfin:
-    [{"index", "index_end", "name", "runtime_secs"}], sorted by episode number.
+    [{"index", "index_end", "name", "runtime_secs", "overview"}], sorted by episode number.
+
+    `overview` is the plot summary — content-based identification (modules/identify.py)
+    matches OCR'd dialogue against it, which disambiguates episodes whose terse
+    "The One with..." titles don't name the plot in the sampled scene.
 
     Unnumbered items (specials with no IndexNumber) are skipped.
     Raises EpisodeGuideError if the show can't be found or a request fails.
@@ -73,7 +77,7 @@ def get_season_episodes(show_name: str, season: int, config) -> List[Dict]:
     if not series_id:
         raise EpisodeGuideError(f"Show not found in Jellyfin: {show_name!r}")
 
-    query = urllib.parse.urlencode({"season": season, "fields": "RunTimeTicks"})
+    query = urllib.parse.urlencode({"season": season, "fields": "Overview,RunTimeTicks"})
     data = _get_json(
         f"{config.jellyfin_url}/Shows/{series_id}/Episodes?{query}",
         config.jellyfin_api_key,
@@ -89,6 +93,7 @@ def get_season_episodes(show_name: str, season: int, config) -> List[Dict]:
             "index_end": it.get("IndexNumberEnd"),
             "name": it.get("Name"),
             "runtime_secs": int(ticks // _TICKS_PER_SEC) if ticks else None,
+            "overview": it.get("Overview"),
         })
     episodes.sort(key=lambda e: e["index"])
     return episodes

@@ -44,10 +44,17 @@ MODEL = "claude-opus-4-8"
 # Chosen over vobsubocr, whose Rust leptonica bindings won't build on leptonica 1.86.
 OCR_CMD = "vobsub2srt"
 
-# How much of the opening to sample. The cold-open/first act is the most
-# episode-distinctive stretch; the shared title montage (~15–50s) is not, so the
-# frame timestamps below deliberately skip it.
-SUBTITLE_WINDOW_SECS = 120
+# Subtitle dialogue is sampled from several points spread ACROSS the episode, not
+# just the opening. Episodes in a serialized arc (S10 Friends' adoption→birth-mother→
+# finale run) open with near-identical dialogue, so the first ~2 min can't tell them
+# apart — verified: it mismatched two such episodes at 0.9+ confidence. Mid- and
+# late-episode dialogue is far more distinctive, so we sample windows at these
+# fractions of the runtime (mirrors the deep frame timestamps below), skipping the
+# opening recap/title montage.
+SUBTITLE_SAMPLE_FRACTIONS = (0.08, 0.30, 0.55, 0.80)
+SUBTITLE_WINDOW_SECS = 45          # width of each sampled window
+SUBTITLE_HEAD_SKIP_SECS = 40       # never sample before this — skips recap/montage
+SUBTITLE_MAX_CHARS = 3500          # keep the OCR'd dialogue prompt bounded
 FRAME_TIMESTAMPS = (8, 300, 500)  # teaser, then two deep-plot beats past the montage
 
 _SUBPROCESS_TIMEOUT = 300
@@ -61,14 +68,27 @@ class IdentifyError(Exception):
 # Candidate rendering + LLM matching (pure / mockable)
 # ---------------------------------------------------------------------------
 
+# Cap each episode overview so a full season stays a reasonable prompt. Summaries
+# are ~200–650 chars; the opening ~350 carry the distinctive plot points.
+_OVERVIEW_MAX_CHARS = 350
+
+
 def _candidate_lines(candidates: List[Dict]) -> str:
-    """Render the Phase-1 episode list as the constrained choice set for the model."""
+    """Render the Phase-1 episode list as the constrained choice set for the model.
+
+    Each line carries the plot overview when available — matching OCR'd dialogue
+    against real summaries (not just cryptic "The One with..." titles) is what lets
+    the model tell serialized-arc / same-length episodes apart.
+    """
     lines = []
     for c in candidates:
         rng = f"E{c['index']:02d}" + (f"-E{c['index_end']:02d}" if c.get("index_end") else "")
         nm = f' "{c["name"]}"' if c.get("name") else ""
         dur = f" (~{round(c['runtime_secs'] / 60)} min)" if c.get("runtime_secs") else ""
         lines.append(f"  {rng}{nm}{dur}")
+        overview = (c.get("overview") or "").strip()
+        if overview:
+            lines.append(f"      {overview[:_OVERVIEW_MAX_CHARS]}")
     return "\n".join(lines)
 
 
@@ -198,30 +218,61 @@ def _find_subtitle_track(mkv_path: Path) -> Optional[int]:
     return streams[0]["index"] if streams else None
 
 
-def _srt_dialogue(srt_text: str, max_secs: int) -> str:
-    """Extract dialogue lines from SRT text up to `max_secs`, joined with spaces."""
-    out = []
-    keep = False
+def _parse_srt_cues(srt_text: str) -> List[tuple]:
+    """Parse SRT text into ordered [(start_secs, text)] cues, dropping indices/blanks."""
+    cues: List[tuple] = []
+    start = None
+    words: List[str] = []
     for line in srt_text.splitlines():
         ts = re.match(r"(\d\d):(\d\d):(\d\d)[,.]\d+ -->", line)
         if ts:
+            if start is not None and words:
+                cues.append((start, " ".join(words)))
             start = int(ts.group(1)) * 3600 + int(ts.group(2)) * 60 + int(ts.group(3))
-            keep = start <= max_secs
+            words = []
             continue
-        if line.strip().isdigit() or not line.strip():
+        s = line.strip()
+        if not s or s.isdigit():
             continue
-        if keep:
-            out.append(line.strip())
-    return " ".join(out)
+        if start is not None:
+            words.append(s)
+    if start is not None and words:
+        cues.append((start, " ".join(words)))
+    return cues
 
 
-def extract_subtitle_text(mkv_path: Path, max_secs: int = SUBTITLE_WINDOW_SECS) -> Optional[str]:
-    """Extract + OCR the opening ~`max_secs` of the main subtitle track.
+def _srt_dialogue(srt_text: str) -> str:
+    """Sample dialogue spread across the episode, joined with spaces.
+
+    Rather than the opening window (which is near-identical across serialized-arc
+    episodes), take a few short windows at SUBTITLE_SAMPLE_FRACTIONS of the runtime,
+    skipping the opening recap/montage. Short tracks with no room to spread are used
+    whole. Output is capped at SUBTITLE_MAX_CHARS.
+    """
+    cues = _parse_srt_cues(srt_text)
+    if not cues:
+        return ""
+    span = max(start for start, _ in cues)
+    # Too short to spread meaningfully → use all the dialogue.
+    if span <= SUBTITLE_HEAD_SKIP_SECS + SUBTITLE_WINDOW_SECS:
+        return " ".join(text for _, text in cues)[:SUBTITLE_MAX_CHARS]
+
+    windows = []
+    for frac in SUBTITLE_SAMPLE_FRACTIONS:
+        anchor = max(SUBTITLE_HEAD_SKIP_SECS, int(frac * span))
+        windows.append((anchor, anchor + SUBTITLE_WINDOW_SECS))
+    out = [text for start, text in cues
+           if any(w0 <= start < w1 for w0, w1 in windows)]
+    return " ".join(out)[:SUBTITLE_MAX_CHARS]
+
+
+def extract_subtitle_text(mkv_path: Path) -> Optional[str]:
+    """Extract + OCR the main subtitle track, then sample dialogue across the episode.
 
     DVD subs are image-based VobSub: mkvextract pulls the .idx/.sub pair, vobsub2srt
-    runs Tesseract to produce an .srt, which we trim to the opening window. Returns
-    None (caller falls back to frames) if there's no subtitle track, a tool is
-    missing, or OCR yields nothing usable.
+    runs Tesseract to produce an .srt for the whole track, from which `_srt_dialogue`
+    samples spread-out windows. Returns None (caller falls back to frames) if there's
+    no subtitle track, a tool is missing, or OCR yields nothing usable.
     """
     track = _find_subtitle_track(mkv_path)
     if track is None:
@@ -242,7 +293,7 @@ def extract_subtitle_text(mkv_path: Path, max_secs: int = SUBTITLE_WINDOW_SECS) 
                 return None
             if not srt.exists():
                 return None
-            dialogue = _srt_dialogue(srt.read_text(errors="replace"), max_secs)
+            dialogue = _srt_dialogue(srt.read_text(errors="replace"))
         except FileNotFoundError as e:
             log.warning(f"OCR toolchain missing ({e}); falling back to frames")
             return None
@@ -281,16 +332,24 @@ def identify_title(title: Dict, candidates: List[Dict], config) -> Dict:
     mkv = title["path"]
     dialogue = extract_subtitle_text(mkv)
     if dialogue:
-        result = _match_subtitles(dialogue, candidates, config.anthropic_api_key)
-        if result["episode"] is not None:
-            return {**title, **result}
-        log.info(f"{mkv.name}: subtitles gave no match; trying frames")
+        # A malformed model reply is a failure of THIS title's subtitle match, not of the
+        # whole rip — degrade to frames rather than letting IdentifyError crash main().
+        try:
+            result = _match_subtitles(dialogue, candidates, config.anthropic_api_key)
+            if result["episode"] is not None:
+                return {**title, **result}
+            log.info(f"{mkv.name}: subtitles gave no match; trying frames")
+        except IdentifyError as e:
+            log.warning(f"{mkv.name}: subtitle match failed ({e}); trying frames")
 
     with tempfile.TemporaryDirectory() as td:
         frames = extract_frames(mkv, Path(td))
         if frames:
-            result = _match_frames(frames, candidates, config.anthropic_api_key)
-            return {**title, **result}
+            try:
+                result = _match_frames(frames, candidates, config.anthropic_api_key)
+                return {**title, **result}
+            except IdentifyError as e:
+                log.warning(f"{mkv.name}: frame match failed ({e})")
 
     log.warning(f"{mkv.name}: could not identify (no subtitles, no frames)")
     return {**title, "episode": None, "index_end": None,

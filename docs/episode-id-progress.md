@@ -57,10 +57,16 @@ fixed in Phase 2.
 
 - `identify_title(title, candidates, config)` — tries the subtitle path first
   (ffprobe finds the track → mkvextract pulls the VobSub `.idx/.sub` → `vobsub2srt`
-  OCRs to SRT → first ~2 min of dialogue → `claude-opus-4-8` matches it against the
-  Phase-1 candidate list), falls back to frames→vision (~3 frames via ffmpeg, skipping
-  the 15–50s title montage) when subs are missing/ambiguous. Returns `episode=None`
-  when nothing matches (bonus/compilation) — never a forced guess.
+  OCRs the whole track to SRT → `_srt_dialogue` samples dialogue **spread across the
+  episode** (windows at 8/30/55/80% of runtime, skipping the opening recap) →
+  `claude-opus-4-8` matches it against the Phase-1 candidate list), falls back to
+  frames→vision (~3 frames via ffmpeg, skipping the 15–50s title montage) when subs are
+  missing/ambiguous. Returns `episode=None` when nothing matches (bonus/compilation) —
+  never a forced guess.
+  - **Sampling was opening-only (first 2 min) until 2026-07-09 verification** showed
+    that fooled serialized-arc episodes whose cold opens are near-identical (Friends
+    S10 adoption B-plot). Spreading the sample across the runtime fixed it — see the
+    verification section below.
 - Out-of-list episode numbers from the model are clamped to `None`, so a title can
   never be numbered as an episode the season doesn't have.
 - `reconcile(identified)` maps identities onto real numbers: drops unmatched titles
@@ -91,16 +97,83 @@ add `#include <climits>`, CMakeLists `-ansi -pedantic`→`-std=c++17`, add
 synthesized MKV (track detect + frame grab + graceful degradation all work). Missing
 tool ⇒ auto frames→vision fallback.
 
-**The one unverified thing:** OCR-*output* correctness. Couldn't synthesize a real
-VobSub `.idx/.sub` offline (ffmpeg refuses text→bitmap sub encoding; no VobSub generator
-packaged), so the `SetImage`/`GetUTF8Text` port is faithful-but-unproven end to end.
-The real test is the first disc rip (see below).
+## Phase 2 — verification against real ripped MKVs — 2026-07-09
+
+Verified end-to-end **without a disc**, using the already-ripped `Friends/Season 10`
+MKVs (17 files, VobSub tracks present) as a labelled corpus. Ground truth = the
+filenames (spot-checked against actual OCR'd content).
+
+- **OCR output correctness: PROVEN.** `vobsub2srt` produces clean, readable English
+  (~11s/file). This was the one thing flagged as unverified — it works.
+- **Opening-only sampling was a real accuracy bug.** First pass scored 3/6 on a
+  sample; the misses were all in Friends S10's serialized adoption→birth-mother→finale
+  arc, whose cold opens all discuss the same baby/adoption B-plot. The model reported
+  **0.9+ confidence on wrong answers**, so confidence can't gate.
+- **Fix 1 — spread the sample.** Sample dialogue across the runtime (`_srt_dialogue` +
+  `SUBTITLE_SAMPLE_FRACTIONS`) instead of the first 120s. **Free** — `vobsub2srt` already
+  OCRs the whole track; we just read more of the SRT. Took the sample from 3/6 → 5/6, but
+  the full season was **14/17 (82%)** — misses E10→E8, E11→E6, E17-E18→E1.
+- **Diagnosis of the residual misses:** the model was matching rich OCR'd dialogue against
+  **cryptic episode titles only** ("The One with Ross's Grant" tells it nothing about the
+  sampled scene). E11's sampled scene was the $100k-Pyramid / stripper subplot; nothing in
+  its title says so, so the model guessed E6.
+- **Fix 2 — feed the model plot summaries.** `episode_guide.get_season_episodes` now fetches
+  Jellyfin `Overview` for each episode; `identify._candidate_lines` renders it under each
+  choice (capped `_OVERVIEW_MAX_CHARS`). The match becomes dialogue → real summary instead
+  of dialogue → title. **Result: 16/17 (94%).** E11 and the finale (now correctly `E17-E18`,
+  range included) both resolved.
+- **Fix 3 — robustness bug found by the run.** A malformed model reply raised `IdentifyError`
+  and **crashed the whole season run** (`identify_title` didn't catch it, violating its own
+  "never crash, degrade to episode=None" contract). `identify_title` now catches it and
+  degrades subtitles→frames→`episode=None`. Regression tests added. **95 unit tests pass.**
+- **Only remaining miss: E10→E8, at 0.85 — the model's lowest confidence of the run.** E10's
+  sampled dialogue overlaps E08's Thanksgiving theme. It collides with the correct E08, so
+  `reconcile` flags it (two titles claim E08, none claims E10) and surfaces it for approval —
+  it won't silently corrupt the library.
+
+**Read on the result:** Friends S10 is close to a worst case — heavily serialized, many
+same-length episodes. At **94%** content-ID is a large improvement over playback-order
+guessing, but not 100%, and confidence is only weakly informative (the one miss was the
+lowest-confidence answer, but plenty of correct answers also sat at 0.9). This **confirms
+the Phase-3 human-approval gate is load-bearing, not optional** — but the mapping it will
+present is now usually right. A more episodic show (The Office, the original trigger) should
+score higher. `reconcile`'s keep-shortest dedup still can't distinguish a wrong same-length
+match, so drops MUST be surfaced for approval, never applied silently.
+
+**Possible cheap follow-up (not done):** pass the ripped title's own runtime into the
+subtitle prompt; widen/add sample windows. Diminishing returns vs. overfitting to this season.
+
+## Phase 2 — PROVEN ON A REAL SCRAMBLED DISC — 2026-07-09
+
+Ran `ripper.py --content-id --show "The Office" --season 1 --dry-run` on **The Office US
+S1 disc 1 — the scrambled disc that started this project.** Full end-to-end: makemkv
+ripped 8 titles → Jellyfin guide (6 eps) → subtitle OCR + match → reconcile → dry-run
+proposal. **Complete success:**
+
+- Disc playback order was genuinely scrambled: title indices t00,t01,t02,t03,t04,t05
+  are episodes **1,3,6,2,4,5**. Content-ID recovered the true numbering — all six by
+  **subtitles at 0.97–0.99 confidence**, no frame fallback:
+  `t00→E01, t03→E02, t01→E03, t04→E04, t05→E05, t02→E06`.
+- The two Play-All titles (44.8 min, 55.9 min) were correctly **dropped** by reconcile
+  ("duplicate of E05 / E04 (longer — 'Play All')").
+- **Order independently confirmed** (not just by the model's confidence): OCR'd the
+  cold-open of each of the 6 files and matched them to the canonical episodes —
+  E01 Pilot ("quarterlies/grasshopper"), E02 Diversity Day, E03 Health Care ("I heal
+  them"), E04 The Alliance (downsizing / "assistant TO the regional manager"), E05
+  Basketball, E06 Hot Girl (the $1,000 incentive). All six correct.
+- `--dry-run` behaved: proposal printed, nothing transferred, 8 MKVs kept in
+  `/var/tmp/ai-ripper`, disc left in the drive. So the real transfer can follow by
+  re-running the same command **without** `--dry-run` (no re-rip).
+
+This closes the last mock-only gap (rip→content-ID integration). The scramble bug that
+motivated the whole rewrite is fixed. Note: the OCR phase for 8 titles (incl. two long
+omnibus titles) took ~12 min — vobsub2srt OCRs the whole track; acceptable but a known cost.
 
 ## What's next
 
-- **Verify `--content-id` on a real disc** — install the toolchain, run
-  `python ripper.py --content-id --show "The Office" --season 1`, confirm a scrambled
-  disc comes out correctly numbered. This is the real proof the scramble is fixed.
+- ~~Verify `--content-id` on a real disc~~ **DONE 2026-07-09** — The Office S1 disc 1
+  unscrambled 6/6 + 2 correct Play-All drops (see section above). Still **no approval gate**,
+  so a plain `--content-id` run transfers straight to Jellyfin — use `--dry-run` until Phase 3.
 - **Phase 3 — Discord approval pipeline** (`modules/approval.py`): webhook → bot,
   post mapping + thumbnails + Approve/Fix buttons, blocking wait, transfer on
   approve. New deps: `discord.py`; new env: `DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`.
@@ -109,13 +182,16 @@ The real test is the first disc rip (see below).
 
 ## Try it on the next disc
 
-**Phase 2 (content-based, the scramble fix) — needs the patched `vobsub2srt` on PATH:**
+**Phase 2 (content-based, the scramble fix) — needs the patched `vobsub2srt` on PATH.
+Validate with `--dry-run` FIRST (no approval gate exists, so a plain run auto-transfers):**
 ```
-python ripper.py --content-id --show "The Office" --season 1
+python ripper.py --content-id --show "The Office" --season 1 --dry-run   # propose only
+python ripper.py --content-id --show "The Office" --season 1             # real transfer
 ```
-Watch the logs for `Content-ID: title #N → The.Office.S01E0X.mkv (subtitles, confidence …)`.
-`method=subtitles` means OCR matching ran; `method=frames` means it fell back to vision.
-This is the disc that finally proves OCR output correctness end to end.
+`--dry-run` logs `DRY RUN — would transfer …` with each `title → S01E0X.mkv [method, conf]`
+and stops (rip + disc kept). Also watch for `Content-ID: title #N → …` and
+`Content-ID dropped title #N …`. `method=subtitles` means OCR matching ran; `method=frames`
+means it fell back to vision. This disc proves the rip→content-ID integration end to end.
 
 **Phase 1 only (provider-aware numbering, no content-ID):**
 ```

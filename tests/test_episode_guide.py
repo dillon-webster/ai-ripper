@@ -53,7 +53,8 @@ def test_get_season_episodes_parses_and_sorts():
     series = {"Items": [{"Name": "The Office", "Id": "us"}]}
     episodes = {"Items": [
         {"IndexNumber": 2, "Name": "Diversity Day", "RunTimeTicks": 13320000000},  # 22.2 min
-        {"IndexNumber": 1, "Name": "Pilot", "RunTimeTicks": 14040000000},          # 23.4 min
+        {"IndexNumber": 1, "Name": "Pilot", "Overview": "Michael films a documentary.",
+         "RunTimeTicks": 14040000000},                                             # 23.4 min
         {"IndexNumber": None, "Name": "A Special", "RunTimeTicks": 10000000},       # skipped
     ]}
     with patch("modules.episode_guide.urllib.request.urlopen",
@@ -61,9 +62,11 @@ def test_get_season_episodes_parses_and_sorts():
         result = get_season_episodes("The Office", 1, CONFIG)
 
     assert [e["index"] for e in result] == [1, 2]  # sorted, special dropped
-    assert result[0] == {"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}
+    assert result[0] == {"index": 1, "index_end": None, "name": "Pilot",
+                         "runtime_secs": 1404, "overview": "Michael films a documentary."}
     assert result[1]["name"] == "Diversity Day"
     assert result[1]["runtime_secs"] == 1332
+    assert result[1]["overview"] is None  # missing Overview → None, not an error
 
 
 def test_get_season_episodes_preserves_index_end():
