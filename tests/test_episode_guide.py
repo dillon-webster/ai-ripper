@@ -94,3 +94,69 @@ def test_get_json_wraps_url_error():
                side_effect=urllib.error.URLError("boom")):
         with pytest.raises(EpisodeGuideError, match="Jellyfin request failed"):
             find_series_id("The Office", CONFIG)
+
+
+# --- TMDB source -----------------------------------------------------------
+
+TMDB_CONFIG = SimpleNamespace(jellyfin_url="http://jf.local", jellyfin_api_key="tok",
+                              tmdb_api_key="tmdb-key")
+
+
+def test_find_series_id_tmdb_prefers_exact_name_over_popular_partial():
+    # TMDB orders by popularity; we still want the exact-name match (the US Office).
+    payload = {"results": [
+        {"name": "The Office (UK)", "id": 111},
+        {"name": "The Office", "id": 2316},
+    ]}
+    with patch("modules.episode_guide.urllib.request.urlopen", return_value=_resp(payload)):
+        assert episode_guide.find_series_id_tmdb("The Office", TMDB_CONFIG) == "2316"
+
+
+def test_tmdb_season_episodes_parses_and_defaults_runtime():
+    search = {"results": [{"name": "The Office", "id": 2316}]}
+    show = {"episode_run_time": [22]}
+    season = {"episodes": [
+        {"episode_number": 2, "name": "Sexual Harassment", "overview": "ob", "runtime": None},
+        {"episode_number": 1, "name": "The Dundies", "overview": "oa", "runtime": 21},
+    ]}
+    with patch("modules.episode_guide.urllib.request.urlopen",
+               side_effect=[_resp(search), _resp(show), _resp(season)]):
+        eps = episode_guide._tmdb_season_episodes("The Office", 2, TMDB_CONFIG)
+    assert [e["index"] for e in eps] == [1, 2]              # sorted
+    assert eps[0]["runtime_secs"] == 21 * 60               # from the episode
+    assert eps[1]["runtime_secs"] == 22 * 60               # fell back to show default
+    assert eps[0]["index_end"] is None
+    assert eps[0]["name"] == "The Dundies"
+
+
+def test_get_season_episodes_prefers_tmdb_when_key_set():
+    fake = [{"index": 1, "index_end": None, "name": "The Dundies",
+             "runtime_secs": 1320, "overview": "x"}]
+    with patch("modules.episode_guide._tmdb_season_episodes", return_value=fake) as tmdb, \
+         patch("modules.episode_guide._jellyfin_season_episodes") as jf:
+        assert get_season_episodes("The Office", 2, TMDB_CONFIG) == fake
+        tmdb.assert_called_once()
+        jf.assert_not_called()  # Jellyfin not even consulted
+
+
+def test_get_season_episodes_falls_back_to_jellyfin_when_tmdb_empty():
+    with patch("modules.episode_guide._tmdb_season_episodes", return_value=[]), \
+         patch("modules.episode_guide._jellyfin_season_episodes", return_value=["jf"]) as jf:
+        assert get_season_episodes("The Office", 2, TMDB_CONFIG) == ["jf"]
+        jf.assert_called_once()
+
+
+def test_get_season_episodes_falls_back_to_jellyfin_when_tmdb_errors():
+    with patch("modules.episode_guide._tmdb_season_episodes",
+               side_effect=EpisodeGuideError("tmdb down")), \
+         patch("modules.episode_guide._jellyfin_season_episodes", return_value=["jf"]) as jf:
+        assert get_season_episodes("The Office", 2, TMDB_CONFIG) == ["jf"]
+        jf.assert_called_once()
+
+
+def test_get_season_episodes_uses_jellyfin_when_no_tmdb_key():
+    with patch("modules.episode_guide._tmdb_season_episodes") as tmdb, \
+         patch("modules.episode_guide._jellyfin_season_episodes", return_value=["jf"]) as jf:
+        assert get_season_episodes("The Office", 2, CONFIG) == ["jf"]  # CONFIG has no tmdb key
+        tmdb.assert_not_called()
+        jf.assert_called_once()

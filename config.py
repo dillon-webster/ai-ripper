@@ -21,6 +21,10 @@ class Config:
     discord_bot_token: str = ""
     discord_channel_id: str = ""
     approval_timeout_secs: int = 1800
+    # TMDB is the preferred episode-guide source: it has every season's episode list
+    # (names + overviews + runtimes) whether or not it's been ripped yet, unlike
+    # Jellyfin which only knows seasons already in your library. Blank ⇒ use Jellyfin.
+    tmdb_api_key: str = ""
 
 
 def load_config() -> Config:
@@ -52,4 +56,5 @@ def load_config() -> Config:
         discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", ""),
         discord_channel_id=os.getenv("DISCORD_CHANNEL_ID", ""),
         approval_timeout_secs=int(os.getenv("APPROVAL_TIMEOUT_SECS", "1800")),
+        tmdb_api_key=os.getenv("TMDB_API_KEY", ""),
     )
