@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from config import Config
 from modules import approval
@@ -75,6 +76,8 @@ def test_request_approval_holds_when_bot_not_configured():
 
 def test_request_approval_never_raises_on_driver_failure(monkeypatch):
     # Bot IS configured, but the async driver blows up — must degrade, not raise.
+    monkeypatch.setattr(approval, "_extract_thumbnails", lambda *a, **k: {})
+
     def boom(*a, **k):
         raise RuntimeError("gateway down")
     monkeypatch.setattr(approval, "_drive", boom)
@@ -84,3 +87,48 @@ def test_request_approval_never_raises_on_driver_failure(monkeypatch):
     )
     assert decision.approved is False
     assert "gateway down" in decision.reason
+
+
+# --- thumbnails ------------------------------------------------------------
+
+def test_extract_thumbnail_seeks_into_episode(tmp_path, monkeypatch):
+    out = tmp_path / "ep_0.jpg"
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = cmd
+        Path(cmd[-1]).write_bytes(b"jpg")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(approval.subprocess, "run", fake_run)
+    ok = approval._extract_thumbnail(
+        {"path": Path("/x/title.mkv"), "duration_secs": 1320, "title_index": 0}, out)
+    assert ok is True
+    assert "528" in captured["cmd"]      # -ss = 40% of 1320s
+    assert captured["cmd"][-1] == str(out)
+
+
+def test_extract_thumbnail_false_without_path(tmp_path):
+    assert approval._extract_thumbnail({"title_index": 0}, tmp_path / "x.jpg") is False
+
+
+def test_extract_thumbnail_false_on_ffmpeg_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(approval.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(returncode=1))
+    assert approval._extract_thumbnail({"path": Path("/x/t.mkv")}, tmp_path / "x.jpg") is False
+
+
+def test_extract_thumbnail_survives_missing_ffmpeg(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise FileNotFoundError("ffmpeg")
+    monkeypatch.setattr(approval.subprocess, "run", boom)
+    assert approval._extract_thumbnail({"path": Path("/x/t.mkv")}, tmp_path / "x.jpg") is False
+
+
+def test_episode_title_uses_tag_and_name():
+    assert approval._episode_title(
+        {"jellyfin_filename": "The.Office.S02E01.mkv", "episode_name": "The Dundies"}
+    ) == "S02E01 — The Dundies"
+    assert approval._episode_title(
+        {"jellyfin_filename": "The.Office.S02E01.mkv"}
+    ) == "S02E01"

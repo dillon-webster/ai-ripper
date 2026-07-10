@@ -19,6 +19,9 @@ the caller holds the files for manual handling rather than transferring blind.
 import asyncio
 import contextlib
 import logging
+import re
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -27,6 +30,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECS = 1800
 _EMBED_FIELD_MAX = 1024  # Discord hard limit on an embed field value
+_MAX_EPISODE_EMBEDS = 9  # Discord allows 10 embeds/msg; reserve 1 for the header/dropped
+_THUMB_TIMESTAMP_FRAC = 0.40  # grab a frame ~40% in — past recaps/montage, into the plot
+_THUMB_FALLBACK_SECS = 300  # if a title has no known duration
+_THUMB_TIMEOUT_SECS = 60
+_EPISODE_TAG_RE = re.compile(r"S\d+E\d+(?:-E\d+)?", re.IGNORECASE)
 
 
 @dataclass
@@ -87,6 +95,7 @@ def _clip(text: str) -> str:
 
 
 def _build_embed(named: List[Dict], dropped: List[Dict], discord):
+    """Compact single-embed fallback (used when no thumbnails could be extracted)."""
     embed = discord.Embed(
         title="🎬 Rip ready for approval",
         description="Review the episode mapping, then tap **Approve** or **Fix**.",
@@ -103,6 +112,98 @@ def _build_embed(named: List[Dict], dropped: List[Dict], discord):
             inline=False,
         )
     return embed
+
+
+# ---------------------------------------------------------------------------
+# Thumbnails: one representative frame per proposed episode
+# ---------------------------------------------------------------------------
+
+def _extract_thumbnail(title: Dict, out_path: Path) -> bool:
+    """Grab one downscaled JPEG ~40% into the episode with ffmpeg. Best-effort:
+    returns False (and the caller shows that episode without an image) if the title
+    has no file, ffmpeg is missing, or the grab fails. Never raises."""
+    mkv = title.get("path")
+    if not mkv:
+        return False
+    dur = title.get("duration_secs")
+    ts = int(dur * _THUMB_TIMESTAMP_FRAC) if dur else _THUMB_FALLBACK_SECS
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(ts), "-i", str(mkv),
+             "-frames:v", "1", "-q:v", "5", "-vf", "scale=480:-1", str(out_path)],
+            capture_output=True, text=True, timeout=_THUMB_TIMEOUT_SECS,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning(f"thumbnail ffmpeg failed for {getattr(mkv, 'name', mkv)}: {e}")
+        return False
+    if result.returncode != 0 or not out_path.exists():
+        log.warning(f"thumbnail grab returned no frame for {getattr(mkv, 'name', mkv)}")
+        return False
+    return True
+
+
+def _extract_thumbnails(named: List[Dict], out_dir: Path) -> Dict:
+    """Extract a thumbnail per shown episode. Returns {title_index: path}."""
+    thumbs = {}
+    ordered = _order_for_display(named)[:_MAX_EPISODE_EMBEDS]
+    for i, t in enumerate(ordered):
+        out = out_dir / f"ep_{i}.jpg"
+        if _extract_thumbnail(t, out):
+            thumbs[t["title_index"]] = out
+    return thumbs
+
+
+def _order_for_display(named: List[Dict]) -> List[Dict]:
+    return sorted(named, key=lambda x: (x.get("episode") is None, x.get("episode") or 0))
+
+
+def _episode_title(t: Dict) -> str:
+    """'S02E01 — The Dundies' from a named title (falls back to the filename)."""
+    m = _EPISODE_TAG_RE.search(t.get("jellyfin_filename", ""))
+    tag = m.group(0).upper() if m else t.get("jellyfin_filename", "?")
+    name = t.get("episode_name")
+    return f"{tag} — {name}" if name else tag
+
+
+def _build_gallery(named: List[Dict], dropped: List[Dict], thumbs: Dict, discord):
+    """Header embed + one image-embed per episode. Returns (embeds, files).
+
+    Falls back to the compact single embed if no thumbnails were extracted, so the
+    approval still works when ffmpeg is unavailable."""
+    if not thumbs:
+        return [_build_embed(named, dropped, discord)], []
+
+    ordered = _order_for_display(named)
+    shown, overflow = ordered[:_MAX_EPISODE_EMBEDS], ordered[_MAX_EPISODE_EMBEDS:]
+
+    header = discord.Embed(
+        title="🎬 Rip ready for approval",
+        description=f"{len(named)} episode(s) — check the frames below, then tap "
+                    "**Approve** or **Fix**.",
+    )
+    if overflow:
+        header.add_field(
+            name=f"+{len(overflow)} more episode(s)",
+            value=_clip("\n".join(format_mapping(overflow))), inline=False)
+    if dropped:
+        header.add_field(
+            name=f"Dropped — not transferred ({len(dropped)})",
+            value=_clip("\n".join(format_dropped(dropped))), inline=False)
+
+    embeds, files = [header], []
+    for i, t in enumerate(shown):
+        conf, method = t.get("confidence"), t.get("method")
+        tag = f"{method} · {conf:.2f}" if method and conf is not None else ""
+        src = _src_name(t)
+        embed = discord.Embed(title=_episode_title(t),
+                              description=f"{src}  ·  {tag}" if tag else src)
+        thumb = thumbs.get(t["title_index"])
+        if thumb:
+            fn = f"ep_{i}.jpg"
+            embed.set_image(url=f"attachment://{fn}")
+            files.append(discord.File(str(thumb), filename=fn))
+        embeds.append(embed)
+    return embeds, files
 
 
 # ---------------------------------------------------------------------------
@@ -125,14 +226,20 @@ def request_approval(named: List[Dict], dropped: List[Dict], config,
                     "holding files for manual handling.")
         return Decision(False, "approval unavailable (bot not configured)")
 
+    # Thumbnails are grabbed synchronously here (ffmpeg subprocess) BEFORE the async
+    # driver, so the temp files stay alive for the whole send. The dir is torn down on
+    # return. Any failure just means fewer/no images — the gallery degrades gracefully.
     try:
-        return asyncio.run(_drive(named, dropped, config, token, int(channel_id), timeout))
+        with tempfile.TemporaryDirectory(prefix="ai-ripper-thumbs-") as td:
+            thumbs = _extract_thumbnails(named, Path(td))
+            return asyncio.run(
+                _drive(named, dropped, thumbs, token, int(channel_id), timeout))
     except Exception as e:  # noqa: BLE001 — approval must never crash the rip
         log.warning(f"Approval flow failed ({e}); holding files for manual handling.")
         return Decision(False, f"approval error: {e}")
 
 
-async def _drive(named, dropped, config, token: str, channel_id: int, timeout: int) -> Decision:
+async def _drive(named, dropped, thumbs, token: str, channel_id: int, timeout: int) -> Decision:
     import discord  # lazy: only an actual approval needs discord.py installed
 
     intents = discord.Intents.none()
@@ -174,11 +281,14 @@ async def _drive(named, dropped, config, token: str, channel_id: int, timeout: i
     async def on_ready():
         try:
             channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
-            # Embed carries the full mapping; a short content line is what shows in the
-            # phone push preview. (format_proposal stays as a plain-text fallback/for tests.)
+            # A header embed + one image-embed per episode (falls back to a single
+            # compact embed if no thumbnails were extracted). The short content line is
+            # what shows in the phone push preview.
+            embeds, files = _build_gallery(named, dropped, thumbs, discord)
             await channel.send(
                 content="🎬 New rip ready for approval — review below.",
-                embed=_build_embed(named, dropped, discord),
+                embeds=embeds,
+                files=files,
                 view=ApprovalView(),
             )
             log.info("Approval request posted to Discord — waiting for Approve/Fix.")

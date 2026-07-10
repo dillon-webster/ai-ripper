@@ -183,11 +183,16 @@ git log for the exact hash). Still uncommitted at time of writing if you're read
 mid-session — check `git status`.
 
 - **New module `modules/approval.py`.** `request_approval(named, dropped, config) -> Decision`.
-  Uses a Discord **bot** (the one-way webhook can't receive taps). Posts an embed — the
-  proposed `title → SxxEyy — name [method, conf]` mapping plus the dropped (Play-All/bonus)
-  list with durations — and two buttons **✅ Approve / ✏️ Fix**. **Blocking** wait with a
-  long timeout (default 1800s, `APPROVAL_TIMEOUT_SECS`). Synchronous to the caller: it runs
-  its own asyncio loop, posts, blocks for the tap, tears down, returns.
+  Uses a Discord **bot** (the one-way webhook can't receive taps). Posts a **header embed**
+  (episode count + the dropped Play-All/bonus list with durations) followed by **one image
+  embed per proposed episode** — title `SxxEyy — name`, source + `method · conf`, and a
+  **thumbnail frame** grabbed ~40% into the episode by ffmpeg (`_extract_thumbnail`, downscaled
+  480px, best-effort) — plus two buttons **✅ Approve / ✏️ Fix**. Capped at 9 episode embeds
+  (Discord's 10-embed limit; overflow listed in the header). If no thumbnails can be extracted
+  (ffmpeg missing/failed) it **falls back to a single compact text embed** so approval still
+  works. **Blocking** wait with a long timeout (default 1800s, `APPROVAL_TIMEOUT_SECS`).
+  Synchronous to the caller: extracts thumbnails, then runs its own asyncio loop, posts,
+  blocks for the tap, tears down, returns.
   - **Fails safe, never raises.** Bot not configured / gateway or login failure / Fix tap /
     timeout all return `Decision(approved=False)` → the caller HOLDS the files. Only an
     explicit Approve returns `approved=True`.
