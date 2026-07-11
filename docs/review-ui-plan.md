@@ -21,10 +21,17 @@ proposal is only the starting point.
 
 ## Decisions already locked with the user
 
-- **Full video playback** (not just thumbnails). The user wants to actually watch
-  a title to identify it. Files are DVD rips: `mpeg2video` + `ac3` audio +
-  `dvd_subtitle` (VobSub) in an MKV — confirmed via ffprobe. **No browser plays any
-  of those natively**, so playback REQUIRES on-the-fly transcoding to H.264/AAC MP4.
+- **Build in two phases (de-risk).** Ship the curation UI with a **filmstrip of
+  stills first (v1, NO transcoding)** — several thumbnails spread across each title
+  is enough to identify a scramble/misID (it's what the user already does by hand
+  with frames), and it's instant and low-risk. **Live video playback is v2**, added
+  only if the filmstrip proves insufficient. The hard/fiddly parts (seek UX, killing
+  ffmpeg on disconnect, browser quirks) all live in v2, so v1 avoids them entirely.
+- **Video playback (v2) needs transcoding.** Files are DVD rips: `mpeg2video` +
+  `ac3` audio + `dvd_subtitle` (VobSub) in an MKV — confirmed via ffprobe. **No
+  browser plays any of those natively**, so v2 playback REQUIRES on-the-fly
+  transcoding to H.264/AAC MP4. v1 sidesteps this (stills only, via a single-frame
+  ffmpeg grab, which is already proven in `approval._extract_thumbnail`).
 - **Supplement, not replace** the Discord flow. Add behind a new opt-in flag
   `--review-ui`. Do not touch `modules/approval.py`'s behavior. When `--review-ui`
   is passed it takes the place of the Discord approval call for that run.
@@ -114,14 +121,24 @@ if review_ui:
 
 ### Endpoints
 
-| Route | Purpose |
-|-------|---------|
-| `GET /` | The review page (self-contained HTML; inline CSS/JS, no external assets). |
-| `GET /thumb/<title_index>?t=<sec>` | One JPEG frame via ffmpeg (reuse the approach in `approval._extract_thumbnail`: `ffmpeg -ss <t> -i <mkv> -frames:v 1 -q:v 5 -vf scale=480:-1 -f mjpeg pipe:1`). Cache to a temp dir so repeat loads are instant. |
-| `GET /play/<title_index>?t=<sec>` | **Live transcode stream.** See below. |
-| `POST /submit` | Body = JSON `{ "assignments": { "<title_index>": <episode_int or null> } }`. Build the curated `named`, set outcome + Event, respond 200. `null`/absent = excluded. |
+| Route | Phase | Purpose |
+|-------|-------|---------|
+| `GET /` | v1 | The review page (self-contained HTML; inline CSS/JS, no external assets). |
+| `GET /thumb/<title_index>?t=<sec>` | v1 | One JPEG frame via ffmpeg (reuse the approach in `approval._extract_thumbnail`: `ffmpeg -ss <t> -i <mkv> -frames:v 1 -q:v 5 -vf scale=480:-1 -f mjpeg pipe:1`). Cache to a temp dir so repeat loads are instant. The filmstrip requests this at several `t` values per title. |
+| `POST /submit` | v1 | Body = JSON `{ "assignments": { "<title_index>": <episode_int or null> } }`. Build the curated `named`, set outcome + Event, respond 200. `null`/absent = excluded. |
+| `GET /play/<title_index>?t=<sec>` | **v2** | **Live transcode stream.** See below — skip for v1. |
 
-### Transcoding for playback (the hard part)
+### Filmstrip (v1)
+
+Per title, request `GET /thumb/<idx>?t=<sec>` at a spread of timestamps across the
+runtime (e.g. 6–9 frames at fractions ~0.1, 0.2, … 0.9 of `duration_secs`) — reuse
+the `SUBTITLE_HEAD_SKIP_SECS` idea so the first frame skips the recap/montage.
+Render them as a horizontal strip in each title card; clicking a still opens it
+larger (a lightbox, pure CSS/JS). Cache grabbed frames in a temp dir keyed by
+`(title_index, t)` so re-renders are instant. This is the whole "see what's on the
+title" mechanism for v1 — no `<video>`, no transcoding.
+
+### Transcoding for playback (v2 — the hard part; skip until v1 is validated)
 
 DVD MPEG-2 can't be remuxed — it must be re-encoded. Do it **on demand, from a seek
 offset**, streamed as fragmented MP4 so playback starts in a few seconds without
@@ -155,12 +172,14 @@ ffmpeg -ss <t> -i <mkv> \
   live as the user changes dropdowns (client-side JS) so gaps/duplicates are obvious.
 - **Titles panel:** a card per entry in `all_titles`, ordered by `title_index`. Each
   card:
-  - thumbnail (`<img src=/thumb/<idx>>`, lazy),
+  - **filmstrip** of stills (`<img src=/thumb/<idx>?t=…>`, lazy) — v1's way to see
+    the content; click a still to enlarge (lightbox),
   - filename + duration + the pipeline's guess ("→ S04E01 Fun Run · subtitles 0.98"
     or "dropped: 44-min Play-All"),
-  - a **Watch** button → reveals a `<video>` + time slider pointed at `/play/<idx>`,
   - an **episode `<select>`**: options = "— exclude —" plus every guide episode
-    (`E01 … EN`), defaulting to the current assignment.
+    (`E01 … EN`), defaulting to the current assignment,
+  - **(v2)** a **Watch** button → reveals a `<video>` + time slider pointed at
+    `/play/<idx>`.
 - **Duplicate guard:** if two titles select the same episode, highlight both and
   disable Submit with a message. (Server should also re-validate and reject dupes.)
 - **Submit** button → POST the assignments JSON.
@@ -201,25 +220,38 @@ Mirror `approval.py`'s split: pure logic unit-tested, I/O deferred.
     a dropped title still appears with its `drop_reason`.
   - `request_review` failure paths return `approved=False` (never raises): bad port,
     timeout (use a tiny timeout in the test), empty guide.
-- **Manual / integration (do when NO rip is running — transcoding is CPU-heavy):**
-  drive it against the held MKVs in `/var/tmp/ai-ripper`. Verify: page loads, thumbs
-  render, Watch streams and is seekable via the slider, reassigning + excluding +
-  submitting yields the expected `named`, and `main` transfers exactly that set.
+- **Manual / integration** against the held MKVs in `/var/tmp/ai-ripper`:
+  - **v1 (filmstrip)** is light (single-frame grabs only) — can be exercised even
+    while a rip runs if needed. Verify: page loads, filmstrip renders across each
+    title, lightbox works, reassigning + excluding + submitting yields the expected
+    `named`, and `main` transfers exactly that set.
+  - **v2 (playback)** is CPU-heavy — only test when NO rip is running. Verify Watch
+    streams and is seekable via the slider, and ffmpeg dies on tab close/seek.
 - Keep the full suite green (`./venv/bin/python -m pytest` — currently 128 tests).
 
 ## Task breakdown (suggested order)
 
+### v1 — filmstrip curation UI (do this first)
+
 1. `modules/review_ui.py`: `ReviewDecision`, pure helpers (page-model assembly,
    assignments→`named`, HTML render). Unit tests for these first.
-2. Server + handler (`GET /`, `/thumb`, `/submit`) + blocking `request_review` with
-   the Event/timeout contract. Unit-test the failure/timeout paths.
-3. `/play` live-transcode endpoint + client disconnect handling.
-4. Frontend page (season panel, title cards, watch/slider, dropdowns, dup guard).
-5. Wire `--review-ui` into `ripper.py::main` + argparse + `config.py`. Ensure
+2. Server + handler (`GET /`, `GET /thumb`, `POST /submit`) + blocking
+   `request_review` with the Event/timeout contract. Unit-test the failure/timeout
+   paths. Frame grabbing reuses `approval._extract_thumbnail` (add a `t=` param).
+3. Frontend page: season panel (filled/empty slots), title cards with **filmstrip**
+   + lightbox, episode dropdowns, duplicate-episode guard. No `<video>`.
+4. Wire `--review-ui` into `ripper.py::main` + argparse + `config.py`. Ensure
    `dry_run` precedence and the hold path (decline/timeout keeps temp + disc,
    `held = True`, `continue`) match the existing approval branch.
-6. Manual integration pass against held MKVs (no active rip). Update
+5. Manual integration pass against held MKVs (no active rip). Update
    `docs/episode-id-progress.md` and the memory notes when done.
+
+### v2 — live playback (only if the filmstrip proves insufficient)
+
+6. `GET /play` live-transcode endpoint + client-disconnect (BrokenPipe) handling +
+   single-transcode concurrency cap.
+7. Add the **Watch** button + `<video>` + seek-slider (reload `?t=`) to the cards.
+8. Manual per-browser check (Chrome/Firefox at least) against held MKVs, no active rip.
 
 ## Gotchas
 
