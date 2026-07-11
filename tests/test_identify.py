@@ -179,6 +179,79 @@ def test_reconcile_sorts_kept_by_episode():
     assert [t["episode"] for t in result["kept"]] == [1, 2, 3]
 
 
+def test_reconcile_duplicate_keeps_episode_nearest_guide_runtime():
+    # The Office S2 E20: the real ~21-min episode, a ~28-min Play-All, and a short gag
+    # reel all matched E20. Old 'shortest wins' kept the gag reel and dropped the real
+    # episode; now the title nearest the guide runtime (the real one) wins.
+    real = _t(1, 20, 1265, confidence=0.90)
+    play_all = _t(8, 20, 1698, confidence=0.80)
+    gag_reel = _t(15, 20, 900, confidence=0.95)
+    result = reconcile([real, play_all, gag_reel], episode_runtimes={20: 1260})
+    assert [t["title_index"] for t in result["kept"]] == [1]  # the real episode
+    reasons = " ".join(d["drop_reason"] for d in result["dropped"])
+    assert "gag reel" in reasons and "Play All" in reasons
+
+
+def test_reconcile_duplicate_without_guide_falls_back_to_shortest():
+    # No guide runtime (legacy path): keep the old shortest-wins Play-All assumption.
+    result = reconcile([_t(0, 1, 2640), _t(1, 1, 1320)])
+    assert [t["title_index"] for t in result["kept"]] == [1]
+
+
+def test_reconcile_drops_lone_title_far_too_short_for_its_episode():
+    # A 9-min bonus content-matched E05 with no real E05 competing — too short to be it.
+    guide = {1: 1320, 2: 1320, 3: 1320, 5: 1320}
+    result = reconcile([_t(0, 1, 1300), _t(1, 2, 1300), _t(2, 3, 1300), _t(3, 5, 540)],
+                       episode_runtimes=guide)
+    assert [t["episode"] for t in result["kept"]] == [1, 2, 3]
+    assert any("too short" in d["drop_reason"] for d in result["dropped"])
+
+
+def test_reconcile_keeps_slightly_short_real_episode():
+    # Real DVD rips run a bit under the listed runtime (~0.96×) — must NOT be dropped.
+    guide = {1: 1320, 2: 1320, 3: 1320}
+    result = reconcile([_t(0, 1, 1267), _t(1, 2, 1270), _t(2, 3, 1266)], episode_runtimes=guide)
+    assert [t["episode"] for t in result["kept"]] == [1, 2, 3]
+    assert result["dropped"] == []
+
+
+def test_reconcile_drops_isolated_low_confidence_as_bonus():
+    # The Office S2 disc 3 case: E13-E18 are a tight block; a 31-min bonus reel got
+    # force-matched to E20 at 0.85 — isolated past the E19 gap → dropped, not numbered.
+    block = [_t(i, 13 + i, 1260, confidence=0.95) for i in range(6)]
+    bonus = _t(14, 20, 1860, confidence=0.85)
+    result = reconcile(block + [bonus])
+    assert [t["episode"] for t in result["kept"]] == [13, 14, 15, 16, 17, 18]
+    assert len(result["dropped"]) == 1
+    assert result["dropped"][0]["title_index"] == 14
+    assert "isolated low-confidence" in result["dropped"][0]["drop_reason"]
+
+
+def test_reconcile_keeps_isolated_but_confident_match():
+    # A lone episode that matched confidently is a real (if oddly-placed) episode, not a bonus.
+    block = [_t(i, 13 + i, 1260, confidence=0.95) for i in range(6)]
+    lone = _t(14, 20, 1260, confidence=0.97)
+    result = reconcile(block + [lone])
+    assert 20 in [t["episode"] for t in result["kept"]]
+    assert result["dropped"] == []
+
+
+def test_reconcile_keeps_low_confidence_match_when_adjacent():
+    # Low confidence alone isn't enough — an episode sitting next to the block is kept.
+    block = [_t(i, 13 + i, 1260, confidence=0.95) for i in range(6)]
+    adjacent = _t(14, 19, 1260, confidence=0.80)
+    result = reconcile(block + [adjacent])
+    assert 19 in [t["episode"] for t in result["kept"]]
+    assert result["dropped"] == []
+
+
+def test_reconcile_trusts_small_sets_without_a_block():
+    # With too few titles there's no contiguous block to be isolated from — trust the matches.
+    result = reconcile([_t(0, 1, 1320, confidence=0.5), _t(1, 8, 1320, confidence=0.5)])
+    assert [t["episode"] for t in result["kept"]] == [1, 8]
+    assert result["dropped"] == []
+
+
 # --- filename building -------------------------------------------------------
 
 def test_build_filename_basic():

@@ -65,6 +65,26 @@ FRAME_TIMESTAMPS = (8, 300, 500)  # teaser, then two deep-plot beats past the mo
 # double-length episodes, whose Jellyfin runtime is itself ~2×.
 OMNIBUS_RUNTIME_FACTOR = 1.5
 
+# The mirror of OMNIBUS_RUNTIME_FACTOR for the too-SHORT direction: a title matched to an
+# episode but running below this fraction of that episode's real runtime is almost
+# certainly a bonus (gag reel, deleted-scenes reel) whose dialogue merely resembles the
+# episode — not the episode itself. It catches a lone bonus that content-matched a number
+# with no real episode competing (the duplicate tie-break only helps when the real episode
+# IS present). Deliberately conservative — real DVD rips run ~0.95× their listed runtime,
+# so 0.6 leaves a wide safety band and can't drop a real episode. Only applied against a
+# true guide runtime (never the median fallback), so it can't misfire off ripped bonuses.
+SHORT_RUNTIME_FACTOR = 0.6
+
+# A DVD disc holds a CONTIGUOUS block of episodes, so a kept title whose episode sits
+# alone — nothing matched at ±1 — is suspect. When that lone title ALSO matched less
+# confidently than a real episode should, it's almost always a bonus reel (deleted
+# scenes, a featurette) whose OCR'd dialogue merely resembles a real episode: content
+# matching can't tell footage cut FROM an episode apart from the episode itself, and the
+# whole-season candidate list lets it land on a number that isn't even on this disc.
+# Below this confidence, such an isolated match is dropped (surfaced for approval, never
+# deleted) rather than numbered as a phantom episode. See reconcile.
+ISOLATED_MATCH_MIN_CONFIDENCE = 0.90
+
 _SUBPROCESS_TIMEOUT = 300
 
 
@@ -383,6 +403,37 @@ def build_named_title(title: Dict, show: str, season: int) -> Dict:
     }
 
 
+def _covered_numbers(t: Dict) -> set:
+    """Episode numbers a title spans: {episode}, or {episode..index_end} for a range."""
+    lo = t["episode"]
+    hi = t.get("index_end") or lo
+    return set(range(lo, hi + 1))
+
+
+def _reject_isolated_low_confidence(kept: List[Dict], dropped: List[Dict]) -> List[Dict]:
+    """Drop kept titles that sit alone (no episode at ±1) AND matched below
+    ISOLATED_MATCH_MIN_CONFIDENCE — the fingerprint of a bonus reel force-matched to an
+    episode not on this disc. Isolated-but-confident matches are kept (a legit lone
+    episode), and real episodes stay high-confidence so a gap from a failed OCR never
+    strands them. Needs a contiguous block to be isolated FROM, so a handful of titles
+    (< 3) is trusted as-is. Dropped titles carry a reason for the approval step."""
+    if len(kept) < 3:
+        return kept
+    survivors = []
+    for t in kept:
+        neighborhood = {n for m in _covered_numbers(t) for n in (m - 1, m, m + 1)}
+        others = {n for o in kept if o is not t for n in _covered_numbers(o)}
+        conf = t.get("confidence", 1.0)
+        if not (neighborhood & others) and conf < ISOLATED_MATCH_MIN_CONFIDENCE:
+            ep = t["episode"]
+            dropped.append({**t, "drop_reason":
+                            f"isolated low-confidence match (E{ep:02d}, conf {conf:.2f}) — "
+                            "not adjacent to the disc's episode block; likely a bonus reel"})
+        else:
+            survivors.append(t)
+    return survivors
+
+
 def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -> Dict:
     """Map identified titles onto real episode numbers, dropping duplicates and bonuses.
 
@@ -424,18 +475,39 @@ def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -
                             f"Play-All/omnibus ({int(dur // 60)} min — "
                             f"~{dur / ref:.1f}× episode length)"})
             continue
+        # Too SHORT for the episode it matched → a bonus, not the episode. Checked only
+        # against the real guide runtime (not median_dur) so it never fires off ripped junk.
+        guide_ref = episode_runtimes.get(episode)
+        if guide_ref and dur and dur < guide_ref * SHORT_RUNTIME_FACTOR:
+            dropped.append({**t, "drop_reason":
+                            f"too short for E{episode:02d} ({int(dur // 60)} min — "
+                            f"~{dur / guide_ref:.1f}× episode length; likely a bonus/gag reel)"})
+            continue
         by_episode.setdefault(episode, []).append(t)
 
     for episode, group in sorted(by_episode.items()):
         if len(group) == 1:
             kept.append(group[0])
             continue
-        # Duplicate claims: the shortest title is the real single episode; the rest
-        # are Play-All/omnibus copies that also open with this episode.
-        group.sort(key=lambda t: t.get("duration_secs", 0))
+        # Several titles claim the same number. Keep the one whose runtime is CLOSEST to
+        # the episode's real length; the rest are non-episodes that merely share its
+        # dialogue — a longer 'Play All' that opens with it, OR a SHORTER bonus (gag reel,
+        # deleted scenes) cut from it. The old rule kept the shortest, assuming the extra
+        # was always a longer compilation — so a short gag reel beat the real episode and
+        # the real one was dropped (The Office S2 E20). Needs the guide runtime; with none
+        # (legacy path) fall back to shortest-wins.
+        ref = episode_runtimes.get(episode)
+        if ref:
+            group.sort(key=lambda t: abs(t.get("duration_secs", 0) - ref))
+        else:
+            group.sort(key=lambda t: t.get("duration_secs", 0))
         kept.append(group[0])
+        real_dur = group[0].get("duration_secs", 0)
         for dup in group[1:]:
-            dropped.append({**dup, "drop_reason": f"duplicate of E{episode:02d} (longer — 'Play All')"})
+            longer = dup.get("duration_secs", 0) > real_dur
+            kind = "longer — 'Play All'" if longer else "shorter — bonus/gag reel"
+            dropped.append({**dup, "drop_reason": f"duplicate of E{episode:02d} ({kind})"})
 
+    kept = _reject_isolated_low_confidence(kept, dropped)
     kept.sort(key=lambda t: t["episode"])
     return {"kept": kept, "dropped": dropped}
