@@ -85,6 +85,13 @@ SHORT_RUNTIME_FACTOR = 0.6
 # deleted) rather than numbered as a phantom episode. See reconcile.
 ISOLATED_MATCH_MIN_CONFIDENCE = 0.90
 
+# Before dropping an isolated match, try to REASSIGN it: an on-disc title the model
+# matched to an off-disc episode of the SAME length (S3 has two ~42-min episodes, E10
+# 'Benihana' and E23 'The Job') should be moved to the adjacent on-disc episode whose
+# runtime fits, not discarded. A title within ±this fraction of an episode's runtime
+# "fits" it. The finale (42.5 min) fits E23 (43 min), not the also-adjacent E18 (22 min).
+RUNTIME_REPAIR_TOL = 0.15
+
 _SUBPROCESS_TIMEOUT = 300
 
 
@@ -130,23 +137,33 @@ _MATCH_RULES = (
     "menu, or 'Play All' compilation of several episodes) — do not force a guess.\n"
     "- Set \"index_end\" only if you matched a listed episode that shows a spanning range "
     "(e.g. E12-E13); otherwise null.\n"
-    "- Judge by plot/dialogue, not runtime alone — runtime only breaks ties.\n"
+    "- Judge primarily by plot/dialogue. The ripped title's runtime is given above: when "
+    "exactly one candidate's runtime is close to it and the others are not, that is strong "
+    "corroborating evidence — prefer it unless the dialogue clearly points elsewhere. A "
+    "title far longer than EVERY candidate is a 'Play All' compilation → null.\n"
 )
 
 
-def _build_subtitle_prompt(dialogue: str, candidates: List[Dict]) -> str:
+def _runtime_line(duration_secs) -> str:
+    if not duration_secs:
+        return ""
+    return f"This ripped title's runtime is ~{round(duration_secs / 60)} min.\n\n"
+
+
+def _build_subtitle_prompt(dialogue: str, candidates: List[Dict], duration_secs=None) -> str:
     return (
         "You are identifying which TV episode a ripped disc title contains, to number it "
-        "for a Jellyfin library. Match the opening dialogue below to exactly one episode.\n\n"
+        "for a Jellyfin library. Match the dialogue below to exactly one episode.\n\n"
         "Candidate episodes for this season (the ONLY valid answers):\n"
         f"{_candidate_lines(candidates)}\n\n"
-        "Opening subtitle dialogue (first ~2 minutes, OCR'd from the disc — may contain "
+        f"{_runtime_line(duration_secs)}"
+        "Subtitle dialogue sampled across the title (OCR'd from the disc — may contain "
         f"OCR errors):\n\"\"\"\n{dialogue.strip()}\n\"\"\"\n\n"
         f"{_MATCH_RULES}"
     )
 
 
-def _build_frame_prompt(candidates: List[Dict]) -> str:
+def _build_frame_prompt(candidates: List[Dict], duration_secs=None) -> str:
     return (
         "You are identifying which TV episode a ripped disc title contains, to number it "
         "for a Jellyfin library. The images are frames sampled from the title (a teaser "
@@ -154,13 +171,27 @@ def _build_frame_prompt(candidates: List[Dict]) -> str:
         "them to exactly one episode.\n\n"
         "Candidate episodes for this season (the ONLY valid answers):\n"
         f"{_candidate_lines(candidates)}\n\n"
+        f"{_runtime_line(duration_secs)}"
         f"{_MATCH_RULES}"
     )
 
 
-def _strip_fences(text: str) -> str:
+def _extract_json(text: str) -> str:
+    """Pull the JSON object out of a model reply that may wrap it in prose or fences.
+
+    The prompt asks for JSON only, but the model sometimes reasons first
+    ('Looking at the dialogue... {"episode": 23}'). Requiring the WHOLE reply to
+    parse threw those away — a correct 0.9-confidence subtitle match on The Office
+    S3 finale was discarded this way, forcing a wrong frame-fallback. Prefer a
+    ```-fenced block; otherwise take the span from the first '{' to the last '}'.
+    """
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-    return m.group(1) if m else text
+    if m:
+        return m.group(1)
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return text[start:end + 1]
+    return text
 
 
 def _parse_match(raw: str, candidates: List[Dict], method: str) -> Dict:
@@ -171,7 +202,7 @@ def _parse_match(raw: str, candidates: List[Dict], method: str) -> Dict:
     that doesn't exist in the season.
     """
     try:
-        data = json.loads(_strip_fences(raw))
+        data = json.loads(_extract_json(raw))
     except (json.JSONDecodeError, TypeError) as e:
         raise IdentifyError(f"Malformed match JSON: {e}") from e
 
@@ -191,17 +222,20 @@ def _parse_match(raw: str, candidates: List[Dict], method: str) -> Dict:
     }
 
 
-def _match_subtitles(dialogue: str, candidates: List[Dict], api_key: str) -> Dict:
+def _match_subtitles(dialogue: str, candidates: List[Dict], api_key: str,
+                     duration_secs=None) -> Dict:
     client = anthropic.Anthropic(api_key=api_key)
     resp = client.messages.create(
         model=MODEL,
         max_tokens=512,
-        messages=[{"role": "user", "content": _build_subtitle_prompt(dialogue, candidates)}],
+        messages=[{"role": "user",
+                   "content": _build_subtitle_prompt(dialogue, candidates, duration_secs)}],
     )
     return _parse_match(resp.content[0].text.strip(), candidates, method="subtitles")
 
 
-def _match_frames(frame_paths: List[Path], candidates: List[Dict], api_key: str) -> Dict:
+def _match_frames(frame_paths: List[Path], candidates: List[Dict], api_key: str,
+                  duration_secs=None) -> Dict:
     client = anthropic.Anthropic(api_key=api_key)
     content = []
     for fp in frame_paths:
@@ -213,7 +247,7 @@ def _match_frames(frame_paths: List[Path], candidates: List[Dict], api_key: str)
                 "data": base64.standard_b64encode(fp.read_bytes()).decode(),
             },
         })
-    content.append({"type": "text", "text": _build_frame_prompt(candidates)})
+    content.append({"type": "text", "text": _build_frame_prompt(candidates, duration_secs)})
     resp = client.messages.create(
         model=MODEL,
         max_tokens=512,
@@ -358,12 +392,14 @@ def identify_title(title: Dict, candidates: List[Dict], config) -> Dict:
     content matches no candidate (bonus/compilation) or identification wasn't possible.
     """
     mkv = title["path"]
+    duration_secs = title.get("duration_secs")
     dialogue = extract_subtitle_text(mkv)
     if dialogue:
         # A malformed model reply is a failure of THIS title's subtitle match, not of the
         # whole rip — degrade to frames rather than letting IdentifyError crash main().
         try:
-            result = _match_subtitles(dialogue, candidates, config.anthropic_api_key)
+            result = _match_subtitles(dialogue, candidates, config.anthropic_api_key,
+                                      duration_secs)
             if result["episode"] is not None:
                 return {**title, **result}
             log.info(f"{mkv.name}: subtitles gave no match; trying frames")
@@ -374,7 +410,8 @@ def identify_title(title: Dict, candidates: List[Dict], config) -> Dict:
         frames = extract_frames(mkv, Path(td))
         if frames:
             try:
-                result = _match_frames(frames, candidates, config.anthropic_api_key)
+                result = _match_frames(frames, candidates, config.anthropic_api_key,
+                                       duration_secs)
                 return {**title, **result}
             except IdentifyError as e:
                 log.warning(f"{mkv.name}: frame match failed ({e})")
@@ -410,27 +447,88 @@ def _covered_numbers(t: Dict) -> set:
     return set(range(lo, hi + 1))
 
 
-def _reject_isolated_low_confidence(kept: List[Dict], dropped: List[Dict]) -> List[Dict]:
-    """Drop kept titles that sit alone (no episode at ±1) AND matched below
-    ISOLATED_MATCH_MIN_CONFIDENCE — the fingerprint of a bonus reel force-matched to an
-    episode not on this disc. Isolated-but-confident matches are kept (a legit lone
-    episode), and real episodes stay high-confidence so a gap from a failed OCR never
-    strands them. Needs a contiguous block to be isolated FROM, so a handful of titles
-    (< 3) is trusted as-is. Dropped titles carry a reason for the approval step."""
+def _adjacent_open_slots(claimed: set, episode_runtimes: Dict[int, int]) -> set:
+    """Unclaimed episode numbers bordering the disc's block (one step beyond min/max, or
+    an interior gap) that the guide knows a runtime for — the only slots an off-disc
+    match may be reassigned into."""
+    if not claimed or not episode_runtimes:
+        return set()
+    lo, hi = min(claimed), max(claimed)
+    return {e for e in range(lo - 1, hi + 2) if e not in claimed and e in episode_runtimes}
+
+
+def _resolve_isolated_matches(kept: List[Dict], dropped: List[Dict],
+                              episode_runtimes: Dict[int, int]) -> List[Dict]:
+    """Handle kept titles that sit alone (no episode at ±1) AND matched below
+    ISOLATED_MATCH_MIN_CONFIDENCE — the fingerprint of an off-disc match: either a bonus
+    reel force-matched to an episode not on this disc, OR a real on-disc episode the
+    model matched to a same-length episode elsewhere in the season (S3's two ~42-min
+    episodes E10/E23). For the latter we REASSIGN by runtime to an adjacent on-disc
+    episode; titles with no fit are dropped.
+
+    Assignment is one-slot-one-title: several isolated ~42-min titles (a real finale AND
+    a same-length bonus 'Play All') can all fit the lone open E23, so the CLOSEST runtime
+    wins the slot and the rest stay dropped — otherwise both would be numbered E23.
+
+    Isolated-but-confident matches are kept (a legit lone episode), and real episodes
+    stay high-confidence so a gap from a failed OCR never strands them. Needs a contiguous
+    block to be isolated FROM, so a handful of titles (< 3) is trusted as-is. Dropped
+    titles carry a reason for the approval step."""
     if len(kept) < 3:
         return kept
-    survivors = []
+
+    anchored, isolated = [], []
     for t in kept:
         neighborhood = {n for m in _covered_numbers(t) for n in (m - 1, m, m + 1)}
         others = {n for o in kept if o is not t for n in _covered_numbers(o)}
-        conf = t.get("confidence", 1.0)
-        if not (neighborhood & others) and conf < ISOLATED_MATCH_MIN_CONFIDENCE:
-            ep = t["episode"]
-            dropped.append({**t, "drop_reason":
-                            f"isolated low-confidence match (E{ep:02d}, conf {conf:.2f}) — "
-                            "not adjacent to the disc's episode block; likely a bonus reel"})
+        if (neighborhood & others) or t.get("confidence", 1.0) >= ISOLATED_MATCH_MIN_CONFIDENCE:
+            anchored.append(t)
         else:
-            survivors.append(t)
+            isolated.append(t)
+    if not isolated:
+        return kept
+
+    claimed = {n for o in anchored for n in _covered_numbers(o)}
+    open_slots = _adjacent_open_slots(claimed, episode_runtimes)
+
+    # Every (title, slot) pair within runtime tolerance, best fit first. Greedily claim
+    # each slot for its closest title (ties broken by higher confidence); a title or slot
+    # is used at most once.
+    proposals = []
+    for t in isolated:
+        dur = t.get("duration_secs")
+        if not dur:
+            continue
+        for e in open_slots:
+            rt = episode_runtimes[e]
+            if abs(dur - rt) <= RUNTIME_REPAIR_TOL * rt:
+                proposals.append((abs(dur - rt), -t.get("confidence", 0.0), id(t), t, e))
+    proposals.sort(key=lambda p: p[:3])
+    used_titles, used_slots, reassign = set(), set(), {}
+    for _, _, tid, t, e in proposals:
+        if tid in used_titles or e in used_slots:
+            continue
+        used_titles.add(tid); used_slots.add(e); reassign[tid] = e
+
+    survivors = list(anchored)
+    for t in isolated:
+        ep = t["episode"]
+        e = reassign.get(id(t))
+        if e is not None:
+            log.info(f"Content-ID: reassigning title #{t.get('title_index')} "
+                     f"E{ep:02d}->E{e:02d} (off-disc match; runtime fits the "
+                     "adjacent on-disc episode)")
+            survivors.append({
+                **t, "episode": e, "index_end": None,
+                "method": f"{t.get('method', '')}+runtime-repair".lstrip("+"),
+                "reasoning": f"content matched E{ep:02d} (off-disc, same length); "
+                             f"reassigned to adjacent on-disc E{e:02d} by runtime",
+            })
+        else:
+            dropped.append({**t, "drop_reason":
+                            f"isolated low-confidence match (E{ep:02d}, "
+                            f"conf {t.get('confidence', 1.0):.2f}) — not adjacent to the "
+                            "disc's episode block; likely a bonus reel"})
     return survivors
 
 
@@ -508,6 +606,6 @@ def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -
             kind = "longer — 'Play All'" if longer else "shorter — bonus/gag reel"
             dropped.append({**dup, "drop_reason": f"duplicate of E{episode:02d} ({kind})"})
 
-    kept = _reject_isolated_low_confidence(kept, dropped)
+    kept = _resolve_isolated_matches(kept, dropped, episode_runtimes)
     kept.sort(key=lambda t: t["episode"])
     return {"kept": kept, "dropped": dropped}

@@ -119,6 +119,23 @@ def test_parse_match_raises_on_garbage():
         _parse_match("not json", CANDIDATES, "subtitles")
 
 
+def test_parse_match_extracts_json_after_reasoning_prose():
+    # Regression: the model reasoned before the JSON (as it did on The Office S3
+    # finale), which used to fail json.loads at char 0 and force a wrong fallback.
+    raw = ('Looking at the dialogue, Dwight is comforted over a breakup and made '
+           '"secret assistant to the regional manager" — this is "The Job".\n\n'
+           '{"episode": 2, "confidence": 0.9, "reasoning": "matches The Job"}')
+    result = _parse_match(raw, CANDIDATES, "subtitles")
+    assert result["episode"] == 2
+    assert result["confidence"] == 0.9
+
+
+def test_parse_match_extracts_fenced_json():
+    raw = '```json\n{"episode": 3, "confidence": 0.7}\n```'
+    result = _parse_match(raw, CANDIDATES, "frames")
+    assert result["episode"] == 3
+
+
 # --- SRT dialogue extraction -----------------------------------------------
 
 def test_srt_dialogue_samples_across_runtime_skipping_opening():
@@ -234,6 +251,43 @@ def test_reconcile_keeps_isolated_but_confident_match():
     result = reconcile(block + [lone])
     assert 20 in [t["episode"] for t in result["kept"]]
     assert result["dropped"] == []
+
+
+def test_reconcile_keeps_a_block_of_long_episodes():
+    # The Office S4 disc 1: E01-E04 are all ~42 min. None must be dropped as an omnibus
+    # (each matches its own 42-min episode, ratio ~1.0), and being same-length is fine —
+    # content-ID distinguishes them, reconcile just must not false-drop.
+    guide = {1: 2520, 2: 2520, 3: 2520, 4: 2520}
+    titles = [_t(i, i + 1, 2520, confidence=0.95) for i in range(4)]
+    result = reconcile(titles, episode_runtimes=guide)
+    assert [t["episode"] for t in result["kept"]] == [1, 2, 3, 4]
+    assert result["dropped"] == []
+
+
+def test_reconcile_reassigns_off_disc_match_to_adjacent_by_runtime():
+    # The Office S3 finale: disc holds E19-E22, plus the 42-min finale, which content-ID
+    # matched to E10 'A Benihana Christmas' (the season's OTHER ~42-min episode, off this
+    # disc) at 0.85. Instead of dropping it, reassign to the adjacent unclaimed episode
+    # whose runtime fits — E23 'The Job' (43m), not the also-adjacent E18 (22m).
+    guide = {18: 1320, 19: 1320, 20: 1320, 21: 1320, 22: 1320, 23: 2580, 10: 2520}
+    block = [_t(i, 19 + i, 1320, confidence=0.98) for i in range(4)]
+    finale = _t(4, 10, 2550, confidence=0.85)
+    result = reconcile(block + [finale], episode_runtimes=guide)
+    assert [t["episode"] for t in result["kept"]] == [19, 20, 21, 22, 23]
+    assert result["dropped"] == []
+    reassigned = next(t for t in result["kept"] if t["episode"] == 23)
+    assert "runtime-repair" in reassigned["method"]
+
+
+def test_reconcile_drops_off_disc_match_with_no_runtime_fit():
+    # Same isolated low-confidence match, but no adjacent unclaimed episode fits its
+    # runtime → still dropped for approval (a genuine bonus reel, not a moved episode).
+    guide = {18: 1320, 19: 1320, 20: 1320, 21: 1320, 22: 1320, 23: 2580, 10: 1860}
+    block = [_t(i, 19 + i, 1320, confidence=0.98) for i in range(4)]
+    bonus = _t(4, 10, 1860, confidence=0.85)  # 31 min — fits no adjacent slot (E18/E23)
+    result = reconcile(block + [bonus], episode_runtimes=guide)
+    assert [t["episode"] for t in result["kept"]] == [19, 20, 21, 22]
+    assert "isolated low-confidence" in result["dropped"][0]["drop_reason"]
 
 
 def test_reconcile_keeps_low_confidence_match_when_adjacent():
