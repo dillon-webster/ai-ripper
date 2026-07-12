@@ -20,6 +20,10 @@ class Config:
     # for success/failure notifications.
     discord_bot_token: str = ""
     discord_channel_id: str = ""
+    # Optional: a Discord user ID to @mention in the approval message. A direct
+    # mention pushes to your phone even when you're active on desktop (Discord
+    # otherwise suppresses the mobile push). Blank ⇒ no mention.
+    discord_mention_user_id: str = ""
     approval_timeout_secs: int = 1800
     # TMDB is the preferred episode-guide source: it has every season's episode list
     # (names + overviews + runtimes) whether or not it's been ripped yet, unlike
@@ -55,6 +59,7 @@ def load_config() -> Config:
         media_root=os.environ["MEDIA_ROOT"],
         discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", ""),
         discord_channel_id=os.getenv("DISCORD_CHANNEL_ID", ""),
+        discord_mention_user_id=os.getenv("DISCORD_MENTION_USER_ID", ""),
         approval_timeout_secs=int(os.getenv("APPROVAL_TIMEOUT_SECS", "1800")),
         tmdb_api_key=os.getenv("TMDB_API_KEY", ""),
     )

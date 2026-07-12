@@ -221,6 +221,7 @@ def request_approval(named: List[Dict], dropped: List[Dict], config,
     timeout = timeout or getattr(config, "approval_timeout_secs", DEFAULT_TIMEOUT_SECS)
     token = getattr(config, "discord_bot_token", "")
     channel_id = getattr(config, "discord_channel_id", "")
+    mention_user_id = getattr(config, "discord_mention_user_id", "")
     if not token or not channel_id:
         log.warning("Discord bot token/channel not configured — cannot request approval; "
                     "holding files for manual handling.")
@@ -233,13 +234,15 @@ def request_approval(named: List[Dict], dropped: List[Dict], config,
         with tempfile.TemporaryDirectory(prefix="ai-ripper-thumbs-") as td:
             thumbs = _extract_thumbnails(named, Path(td))
             return asyncio.run(
-                _drive(named, dropped, thumbs, token, int(channel_id), timeout))
+                _drive(named, dropped, thumbs, token, int(channel_id), timeout,
+                       mention_user_id))
     except Exception as e:  # noqa: BLE001 — approval must never crash the rip
         log.warning(f"Approval flow failed ({e}); holding files for manual handling.")
         return Decision(False, f"approval error: {e}")
 
 
-async def _drive(named, dropped, thumbs, token: str, channel_id: int, timeout: int) -> Decision:
+async def _drive(named, dropped, thumbs, token: str, channel_id: int, timeout: int,
+                 mention_user_id: str = "") -> Decision:
     import discord  # lazy: only an actual approval needs discord.py installed
 
     intents = discord.Intents.none()
@@ -285,11 +288,16 @@ async def _drive(named, dropped, thumbs, token: str, channel_id: int, timeout: i
             # compact embed if no thumbnails were extracted). The short content line is
             # what shows in the phone push preview.
             embeds, files = _build_gallery(named, dropped, thumbs, discord)
+            # A direct @mention pushes to the phone even while active on desktop
+            # (Discord otherwise suppresses the mobile push). allowed_mentions must
+            # permit the user ping explicitly, or discord.py can silence it.
+            prefix = f"<@{mention_user_id}> " if mention_user_id else ""
             await channel.send(
-                content="🎬 New rip ready for approval — review below.",
+                content=f"{prefix}🎬 New rip ready for approval — review below.",
                 embeds=embeds,
                 files=files,
                 view=ApprovalView(),
+                allowed_mentions=discord.AllowedMentions(users=True),
             )
             log.info("Approval request posted to Discord — waiting for Approve/Fix.")
         except Exception as e:  # noqa: BLE001
