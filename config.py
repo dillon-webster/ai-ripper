@@ -25,6 +25,11 @@ class Config:
     # otherwise suppresses the mobile push). Blank ⇒ no mention.
     discord_mention_user_id: str = ""
     approval_timeout_secs: int = 1800
+    # Web review UI (--review-ui): local curation page served from the rip-box,
+    # reachable over the tailnet only — never expose the port to the internet.
+    review_ui_port: int = 8765
+    review_ui_timeout_secs: int = 1800
+    review_ui_thumbs_per_title: int = 12
     # TMDB is the preferred episode-guide source: it has every season's episode list
     # (names + overviews + runtimes) whether or not it's been ripped yet, unlike
     # Jellyfin which only knows seasons already in your library. Blank ⇒ use Jellyfin.
@@ -61,5 +66,8 @@ def load_config() -> Config:
         discord_channel_id=os.getenv("DISCORD_CHANNEL_ID", ""),
         discord_mention_user_id=os.getenv("DISCORD_MENTION_USER_ID", ""),
         approval_timeout_secs=int(os.getenv("APPROVAL_TIMEOUT_SECS", "1800")),
+        review_ui_port=int(os.getenv("REVIEW_UI_PORT", "8765")),
+        review_ui_timeout_secs=int(os.getenv("REVIEW_UI_TIMEOUT_SECS", "1800")),
+        review_ui_thumbs_per_title=int(os.getenv("REVIEW_UI_THUMBS_PER_TITLE", "12")),
         tmdb_api_key=os.getenv("TMDB_API_KEY", ""),
     )

@@ -306,3 +306,23 @@ If the Jellyfin lookup fails, either command logs a warning and names the disc t
 - **Don't delete a show's season from Jellyfin to "test from scratch":** `episode_guide` pulls
   the episode list (the match key) *from* Jellyfin, so removing it makes content-ID fall back
   to the scrambled legacy namer.
+
+## Review UI v1 (--review-ui) — built 2026-07-12, pending real-disc validation
+
+`modules/review_ui.py` per docs/review-ui-plan.md: a stdlib `ThreadingHTTPServer`
+inside the ripper serves a self-contained curation page (filmstrip of ffmpeg
+stills per ripped title — kept AND dropped — episode dropdowns, season slot
+panel, lightbox with ±10/±60s stepping, dupe guard client- AND server-side).
+`request_review` mirrors `approval.request_approval`: blocks, never raises,
+holds on timeout/failure. `--review-ui` supersedes `--approve` for the run;
+`--dry-run` still wins. Thumbs cache in `<temp_dir>/review-thumbs/` (cleaned on
+shutdown), grabs capped at 2 concurrent ffmpegs, filmstrips lazy-load per card.
+Config: `REVIEW_UI_PORT` (8765), `REVIEW_UI_TIMEOUT_SECS` (1800),
+`REVIEW_UI_THUMBS_PER_TITLE` (12).
+
+Verified without a real rip (temp dir was clean): full HTTP round trip against
+synthetic mpeg2+ac3 MKVs (page, thumb grabs incl. cache hit + out-of-range clamp,
+400 on duplicate assignment, curated submit returning the reassigned list, cache
+dir cleanup) plus the page JS run under gjs/SpiderMonkey with a DOM stub. **Next
+disc ripped with `--review-ui` is the real validation pass** (v1 grabs are light —
+safe even during a rip). v2 live playback: only if filmstrips prove insufficient.

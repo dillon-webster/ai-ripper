@@ -5,6 +5,7 @@ from pathlib import Path
 
 from config import load_config
 from modules import approval, disc_watcher, episode_guide, identify, namer, notifier, transfer
+from modules import review_ui as review_ui_mod  # aliased: main()'s review_ui flag shadows the name
 from modules import ripper as disc_ripper
 from modules.episode_guide import EpisodeGuideError
 from modules.namer import NamerError
@@ -91,7 +92,8 @@ def name_by_content(titles, guide, show, season, config):
 
 
 def main(season: int = None, disc: int = None, show: str = None,
-         content_id: bool = False, dry_run: bool = False, approve: bool = False) -> None:
+         content_id: bool = False, dry_run: bool = False, approve: bool = False,
+         review_ui: bool = False) -> None:
     config = load_config()
     log.info("DVD Auto-Ripper started. Waiting for disc...")
     if season is not None:
@@ -188,10 +190,31 @@ def main(season: int = None, disc: int = None, show: str = None,
                 log.info(f"DRY RUN — temp files kept in {config.temp_dir}; disc not ejected.")
                 return
 
+            # Web review UI (--review-ui): the user hand-curates the full mapping in
+            # the browser — every ripped title (kept AND dropped) can be reassigned,
+            # added back, or excluded. Takes the place of the Discord approval gate
+            # for this run; decline/timeout/failure HOLDS exactly like --approve.
+            if review_ui:
+                if approve:
+                    log.info("--review-ui supersedes --approve this run — Discord approval skipped.")
+                decision = review_ui_mod.request_review(
+                    titles, named, dropped, guide, show, season, config)
+                if not decision.approved:
+                    log.warning(f"Rip held — {decision.reason}. "
+                                f"Files kept in {config.temp_dir}; fix and re-run.")
+                    notifier.send_discord(
+                        [], success=False,
+                        error=f"Held for manual handling: {decision.reason}", config=config)
+                    held = True
+                    continue
+                named = decision.titles  # curated list replaces the pipeline's proposal
+                log.info(f"Review complete — {decision.reason}. "
+                         f"Transferring {len(named)} curated title(s).")
+
             # Phase 3 approval gate: a human confirms the mapping over Discord before
             # it's written to the library. On decline/timeout/misconfig we HOLD (keep
             # temp files + disc), never transfer a possibly-wrong mapping.
-            if approve:
+            elif approve:
                 decision = approval.request_approval(named, dropped, config)
                 if not decision.approved:
                     log.warning(f"Rip held — {decision.reason}. "
@@ -262,6 +285,15 @@ if __name__ == "__main__":
              "Requires DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID. Ignored with --dry-run.",
     )
     parser.add_argument(
+        "--review-ui", action="store_true",
+        help="Serve a local web page (tailnet-only, port REVIEW_UI_PORT) to review and "
+             "hand-curate the episode mapping before transfer: every ripped title is "
+             "shown with a filmstrip of stills and can be reassigned, added back, or "
+             "excluded. Takes the place of --approve for the run. Requires --show and "
+             "--season (needs the episode guide). On timeout/failure files are held in "
+             "TEMP_DIR. Ignored with --dry-run.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Rip and name the disc, print the proposed episode mapping, then STOP before "
              "transferring anything to Jellyfin. Ripped files are kept and the disc is left "
@@ -270,4 +302,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(season=args.season, disc=args.disc, show=args.show,
-         content_id=args.content_id, dry_run=args.dry_run, approve=args.approve)
+         content_id=args.content_id, dry_run=args.dry_run, approve=args.approve,
+         review_ui=args.review_ui)

@@ -305,3 +305,126 @@ def test_main_loop_sends_failure_discord_on_rip_error(tmp_path):
     mock_discord.assert_called_once_with(
         [], success=False, error="makemkvcon crashed", config=config
     )
+
+
+def test_main_loop_review_ui_transfers_curated_titles(tmp_path):
+    """--review-ui replaces the proposal with the user's curated list and transfers
+    exactly that — including a title the pipeline had dropped."""
+    from modules.review_ui import ReviewDecision
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    identified = [{**raw_titles[0], "episode": 1, "index_end": None,
+                   "confidence": 0.98, "method": "subtitles"}]
+    curated = [{**raw_titles[0], "episode": 1, "jellyfin_filename": "The.Office.S01E01.mkv",
+                "episode_name": "Pilot", "media_type": "tv", "destination": "tvshows",
+                "is_extra": False, "method": "review-ui", "confidence": 1.0}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.review_ui_mod.request_review",
+               return_value=ReviewDecision(True, "reviewed via web UI", titles=curated)) as mock_review, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]) as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp") as mock_cleanup, \
+         patch("ripper.eject_disc") as mock_eject:
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office", content_id=True, review_ui=True)
+
+    # The review got the FULL rip list plus the proposal and the guide.
+    args = mock_review.call_args[0]
+    assert args[0] == raw_titles          # all_titles
+    assert args[3] == guide               # guide
+    assert args[4:6] == ("The Office", 1)
+    # And exactly the curated list transferred.
+    assert mock_send.call_args[0][0] is curated
+    mock_cleanup.assert_called_once()
+    mock_eject.assert_called_once()
+
+
+def test_main_loop_review_ui_holds_files_on_timeout(tmp_path):
+    """Review timeout/failure must hold like an approval decline: no transfer, no
+    cleanup, no eject, and a failure notice posted."""
+    from modules.review_ui import ReviewDecision
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    identified = [{**raw_titles[0], "episode": 1, "index_end": None,
+                   "confidence": 0.98, "method": "subtitles"}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.review_ui_mod.request_review",
+               return_value=ReviewDecision(False, "review timed out after 1800s")), \
+         patch("ripper.transfer.send_all") as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan") as mock_scan, \
+         patch("ripper.notifier.send_discord") as mock_discord, \
+         patch("ripper.cleanup_temp") as mock_cleanup, \
+         patch("ripper.eject_disc") as mock_eject:
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office", content_id=True, review_ui=True)
+
+    mock_send.assert_not_called()
+    mock_scan.assert_not_called()
+    mock_cleanup.assert_not_called()  # rip held for manual handling
+    mock_eject.assert_not_called()    # disc left in the drive
+    mock_discord.assert_called_once()
+    assert mock_discord.call_args.kwargs["success"] is False
+
+
+def test_main_loop_review_ui_supersedes_approve(tmp_path):
+    """When both flags are passed, the web review runs and the Discord approval
+    gate is skipped for the run."""
+    from modules.review_ui import ReviewDecision
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    identified = [{**raw_titles[0], "episode": 1, "index_end": None,
+                   "confidence": 0.98, "method": "subtitles"}]
+    curated = [{**raw_titles[0], "episode": 1, "jellyfin_filename": "The.Office.S01E01.mkv",
+                "media_type": "tv", "destination": "tvshows", "is_extra": False}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.review_ui_mod.request_review",
+               return_value=ReviewDecision(True, "reviewed via web UI", titles=curated)), \
+         patch("ripper.approval.request_approval") as mock_approve, \
+         patch("ripper.transfer.send_all") as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office", content_id=True,
+                        approve=True, review_ui=True)
+
+    mock_approve.assert_not_called()  # Discord gate skipped this run
+    mock_send.assert_called_once()

@@ -1,7 +1,14 @@
 # Implementation Plan: Web-based Disc Review UI (`--review-ui`)
 
-**Status:** not started. Write this feature on the `phase1-provider-aware-episodes`
-branch (where the content-ID pipeline lives). Repo venv is `./venv`
+**Status:** v1 (filmstrip curation UI) **built 2026-07-12** on
+`phase1-provider-aware-episodes` — `modules/review_ui.py`, wired into
+`ripper.py --review-ui` + `config.py`/`.env.example`, 157 tests green. Validated
+end-to-end against synthetic DVD-style MKVs (mpeg2video+ac3): page, real ffmpeg
+filmstrip grabs + cache + cleanup, server-side dupe rejection, curated submit;
+page JS exercised under SpiderMonkey (dupe guard, slots, lightbox clamping).
+**Still owed: a manual pass on a real held rip** (none were in
+`/var/tmp/ai-ripper` at build time). v2 (live playback) not started — only if
+the filmstrip proves insufficient. Repo venv is `./venv`
 (`./venv/bin/python -m pytest`) — the system python3 has no pytest.
 
 ## Goal
@@ -73,6 +80,9 @@ proposal is only the starting point.
 - `transfer.send_all(named, config)` is what writes to the server; it consumes the
   named-title shape above. So the review UI's job is to return a correct `named` list.
 - `config.temp_dir` = `/var/tmp/ai-ripper` (held MKVs live here — good test fixtures).
+  **Thumbnail cache must go in a dedicated subdir** (e.g.
+  `<temp_dir>/review-thumbs/`), not `temp_dir` itself, so cached JPEGs never sit next
+  to (or get confused with) the held rips. Clean the subdir on server shutdown.
 - Mirror the **contract of `approval.request_approval`**: synchronous from the
   caller, blocks until decision or timeout, and **NEVER raises** — on any failure
   (port in use, timeout, etc.) return "not approved" so `main` holds the files.
@@ -109,7 +119,12 @@ if review_ui:
 
 - `ThreadingHTTPServer` bound to `0.0.0.0` on a configurable port
   (`config.review_ui_port`, default e.g. 8765) so it's reachable from a laptop/phone
-  on the LAN. Log the URL with the rip-box hostname/IP.
+  over the **tailnet** (Tailscale). `0.0.0.0` = all of the rip-box's own interfaces,
+  NOT public — reachable only by devices that can already route to the rip-box, i.e.
+  your tailnet. Log the URL using the rip-box's Tailscale name/hostname.
+  **Not internet-exposed:** no port-forwarding, no reverse proxy, and **do not enable
+  Tailscale Funnel** on this port (Funnel is the one feature that would make it
+  public). Plain Tailscale keeps it private to your own devices.
 - Run it in a background thread; `request_review` waits on a `threading.Event` that
   the POST `/submit` handler (or a timeout) sets, then shuts the server down and
   returns.
@@ -124,19 +139,32 @@ if review_ui:
 | Route | Phase | Purpose |
 |-------|-------|---------|
 | `GET /` | v1 | The review page (self-contained HTML; inline CSS/JS, no external assets). |
-| `GET /thumb/<title_index>?t=<sec>` | v1 | One JPEG frame via ffmpeg (reuse the approach in `approval._extract_thumbnail`: `ffmpeg -ss <t> -i <mkv> -frames:v 1 -q:v 5 -vf scale=480:-1 -f mjpeg pipe:1`). Cache to a temp dir so repeat loads are instant. The filmstrip requests this at several `t` values per title. |
+| `GET /thumb/<title_index>?t=<sec>` | v1 | One JPEG frame via ffmpeg (reuse the approach in `approval._extract_thumbnail`: `ffmpeg -ss <t> -i <mkv> -frames:v 1 -q:v 5 -vf scale=480:-1 -f mjpeg pipe:1`). Cache to a dedicated subdir (see below) so repeat loads are instant. Validate `<title_index>` against `by_index` and reject unknown indices (input hygiene — don't spawn ffmpeg on unexpected input). The filmstrip requests this at several `t` values per title. |
 | `POST /submit` | v1 | Body = JSON `{ "assignments": { "<title_index>": <episode_int or null> } }`. Build the curated `named`, set outcome + Event, respond 200. `null`/absent = excluded. |
 | `GET /play/<title_index>?t=<sec>` | **v2** | **Live transcode stream.** See below — skip for v1. |
 
 ### Filmstrip (v1)
 
-Per title, request `GET /thumb/<idx>?t=<sec>` at a spread of timestamps across the
-runtime (e.g. 6–9 frames at fractions ~0.1, 0.2, … 0.9 of `duration_secs`) — reuse
-the `SUBTITLE_HEAD_SKIP_SECS` idea so the first frame skips the recap/montage.
-Render them as a horizontal strip in each title card; clicking a still opens it
-larger (a lightbox, pure CSS/JS). Cache grabbed frames in a temp dir keyed by
-`(title_index, t)` so re-renders are instant. This is the whole "see what's on the
-title" mechanism for v1 — no `<video>`, no transcoding.
+Per title, request `GET /thumb/<idx>?t=<sec>` at a spread of timestamps evenly
+across the runtime — reuse the `SUBTITLE_HEAD_SKIP_SECS` idea so the first frame
+skips the recap/montage. **The user needs enough frames to positively verify the
+episode**, so default generous and make it configurable:
+`config.review_ui_thumbs_per_title` (default 12). Render them as a horizontal strip
+in each title card; clicking a still opens it larger (a lightbox, pure CSS/JS). Cache
+grabbed frames keyed by `(title_index, t)` so re-renders are instant.
+
+A generous count means a bigger grab burst, so keep it from competing with a rip:
+- **Lazy-load per visible card** (IntersectionObserver) — only cards scrolled into
+  view fire their `/thumb` grabs, not all titles at once on page load.
+- **Server-side concurrency cap** (2–3 concurrent `-ss` grabs; queue the rest) so a
+  card full of thumbnails can't spawn a dozen ffmpeg processes simultaneously.
+- **On-demand finer frames in the lightbox:** from an enlarged still, let the user
+  step to adjacent timestamps (grabbed on demand). This way 12 evenly-spread frames
+  bound the initial load, but the user can drill into any region for as much detail
+  as verification needs without pre-loading hundreds.
+
+This is the whole "see what's on the title" mechanism for v1 — no `<video>`, no
+transcoding.
 
 ### Transcoding for playback (v2 — the hard part; skip until v1 is validated)
 
@@ -206,8 +234,9 @@ return ReviewDecision(True, "reviewed via web UI", titles=named)
 
 - argparse `--review-ui` (store_true) in `ripper.py`, threaded through `main`.
 - `config.py`: `review_ui_port` (env `REVIEW_UI_PORT`, default 8765),
-  `review_ui_timeout_secs` (env `REVIEW_UI_TIMEOUT_SECS`, default 1800). Follow the
-  existing `load_config()` env pattern (config.py:34+).
+  `review_ui_timeout_secs` (env `REVIEW_UI_TIMEOUT_SECS`, default 1800),
+  `review_ui_thumbs_per_title` (env `REVIEW_UI_THUMBS_PER_TITLE`, default 12). Follow
+  the existing `load_config()` env pattern (config.py:34+).
 
 ## Testing
 
@@ -256,8 +285,15 @@ Mirror `approval.py`'s split: pure logic unit-tested, I/O deferred.
 ## Gotchas
 
 - **Never raise** out of `request_review` — `main` must be able to hold on failure.
-- Bind `0.0.0.0`, not `127.0.0.1`, or a phone/laptop can't reach it. Log the actual
-  LAN URL.
+- The server runs **in-process inside the ripper**, on the rip-box (that's where the
+  MKVs and ffmpeg are) — there is no separate host for it. The separate always-on
+  server machine is intentionally NOT involved. Bind `0.0.0.0`, not `127.0.0.1`, so
+  it's reachable over the **tailnet** (the user reaches the rip-box via Tailscale).
+  Log the actual URL using the rip-box's Tailscale name. No auth needed — the tailnet
+  is the trust boundary; do not add a login. **Never internet-exposed:** no
+  port-forwarding, no reverse proxy, and do NOT enable Tailscale Funnel on this port.
+- **Cap `/thumb` concurrency** (2–3 concurrent ffmpeg grabs) and lazy-load filmstrips
+  per visible card, so a generous thumbnail count doesn't spike CPU into an active rip.
 - Kill ffmpeg on client disconnect (broken pipe on `wfile.write`) to avoid orphaned
   transcodes.
 - `-ss` position semantics: fast-seek before `-i`; acceptable for identification.
