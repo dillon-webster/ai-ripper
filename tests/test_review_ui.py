@@ -1,15 +1,27 @@
 import json
+import re
 import socket
 import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from config import Config
 from modules import review_ui
 from modules.review_ui import ReviewDecision
+
+
+@pytest.fixture(autouse=True)
+def notify_calls(monkeypatch):
+    """request_review pings Discord (with retries) once the server is up — stub it
+    so tests never attempt real webhook posts, and record the advertised URLs."""
+    calls = []
+    monkeypatch.setattr(review_ui.notifier, "send_review_ready",
+                        lambda url, show, season, config: calls.append(url))
+    return calls
 
 
 def _config(tmp_path, **over):
@@ -139,6 +151,23 @@ def test_page_model_is_json_serializable():
     json.dumps(model)  # Paths etc. must already be plain types
 
 
+def test_page_model_nonce_unique_per_build():
+    # Discs reuse title indices and timestamps; only the nonce keeps two review
+    # sessions' thumb URLs distinct, so it must differ every build.
+    m1 = review_ui.build_page_model(_all_titles(), _named(), _dropped(),
+                                    _guide(), "The Office", 2)
+    m2 = review_ui.build_page_model(_all_titles(), _named(), _dropped(),
+                                    _guide(), "The Office", 2)
+    assert m1["nonce"] and m2["nonce"]
+    assert m1["nonce"] != m2["nonce"]
+
+
+def test_page_model_explicit_nonce_is_kept():
+    model = review_ui.build_page_model(_all_titles(), _named(), _dropped(),
+                                       _guide(), "The Office", 2, nonce="abc123")
+    assert model["nonce"] == "abc123"
+
+
 # --- build_curated_named -----------------------------------------------------
 
 def test_curated_named_builds_transfer_ready_titles():
@@ -213,6 +242,28 @@ def test_render_page_neutralizes_closing_tags_in_data():
     assert "X</script><script>alert(1)" not in html
 
 
+# --- _advertised_host ---------------------------------------------------------
+
+def test_advertised_host_override_wins(tmp_path):
+    cfg = _config(tmp_path, review_ui_advertise_host="ripbox.tail1234.ts.net")
+    assert review_ui._advertised_host(cfg) == "ripbox.tail1234.ts.net"
+
+
+def test_advertised_host_prefers_tailscale_ip(tmp_path, monkeypatch):
+    def fake_run(cmd, **kw):
+        assert cmd[0] == "tailscale"
+        return SimpleNamespace(returncode=0, stdout="100.64.0.7\n")
+    monkeypatch.setattr(review_ui.subprocess, "run", fake_run)
+    assert review_ui._advertised_host(_config(tmp_path)) == "100.64.0.7"
+
+
+def test_advertised_host_falls_back_to_hostname(tmp_path, monkeypatch):
+    def fake_run(cmd, **kw):
+        raise FileNotFoundError("tailscale not installed")
+    monkeypatch.setattr(review_ui.subprocess, "run", fake_run)
+    assert review_ui._advertised_host(_config(tmp_path)) == review_ui.socket.gethostname()
+
+
 # --- request_review failure paths (never raises) ------------------------------
 
 def test_request_review_holds_without_guide(tmp_path):
@@ -252,6 +303,23 @@ def test_request_review_cleans_thumb_cache_dir(tmp_path):
     assert not (tmp_path / "review-thumbs").exists()
 
 
+def test_request_review_wipes_stale_thumbs_on_start(tmp_path):
+    # A killed run (Ctrl-C, power loss) skips the finally-cleanup; a leftover frame
+    # keyed the same way would otherwise be served as the NEW disc's frame.
+    stale = tmp_path / "review-thumbs" / "t0_100.jpg"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"frame from a previous disc")
+    seen = {}
+
+    def on_start(host, port):
+        seen["stale_exists"] = stale.exists()
+
+    review_ui.request_review(_all_titles(), _named(), _dropped(), _guide(),
+                             "The Office", 2, _config(tmp_path), timeout=0.2,
+                             _on_start=on_start)
+    assert seen["stale_exists"] is False
+
+
 # --- request_review round trip over real HTTP ---------------------------------
 
 def _submit(port, assignments, path="/submit"):
@@ -262,7 +330,7 @@ def _submit(port, assignments, path="/submit"):
     return urllib.request.urlopen(req, timeout=5)
 
 
-def test_request_review_round_trip_returns_curated_titles(tmp_path):
+def test_request_review_round_trip_returns_curated_titles(tmp_path, notify_calls):
     started = threading.Event()
     bound = {}
 
@@ -281,6 +349,11 @@ def test_request_review_round_trip_returns_curated_titles(tmp_path):
     t.start()
     assert started.wait(5)
     port = bound["port"]
+
+    # The Discord ping carried the review link (host may be a tailscale IP or the
+    # LAN hostname depending on the box — the port pins it to this server).
+    assert len(notify_calls) == 1
+    assert notify_calls[0].startswith("http://") and f":{port}/" in notify_calls[0]
 
     # The page serves with the model embedded.
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as res:
@@ -306,7 +379,7 @@ def test_request_review_round_trip_returns_curated_titles(tmp_path):
     assert d.titles[0]["title_index"] == 1
 
 
-def test_thumb_endpoint_rejects_unknown_title_index(tmp_path):
+def test_thumb_endpoint_rejects_unknown_title_and_stale_nonce(tmp_path):
     started = threading.Event()
     bound = {}
 
@@ -326,8 +399,28 @@ def test_thumb_endpoint_rejects_unknown_title_index(tmp_path):
     assert started.wait(5)
     port = bound["port"]
 
+    # The served page embeds this session's nonce in the model.
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as res:
+        page = res.read().decode()
+    m = re.search(r'"nonce":\s*"([0-9a-f]+)"', page)
+    assert m, "page model must embed the session nonce"
+    nonce = m.group(1)
+
+    # Right session, unknown title index → 404.
     with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/thumb/99?t=10", timeout=5)
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/thumb/{nonce}/99?t=10", timeout=5)
+    assert exc.value.code == 404
+
+    # A tab left over from a previous disc (wrong nonce) → 404, valid index or not.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/thumb/deadbeefdeadbeef/0?t=10", timeout=5)
+    assert exc.value.code == 404
+
+    # The old nonce-less URL shape is gone too.
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/thumb/0?t=10", timeout=5)
     assert exc.value.code == 404
 
     # Unblock the review so the thread exits.

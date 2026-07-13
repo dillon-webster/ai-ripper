@@ -49,6 +49,37 @@ def trigger_jellyfin_scan(config) -> None:
     log.info("Jellyfin library scan triggered")
 
 
+def send_review_ready(url: str, show: str, season: int, config) -> None:
+    """Ping Discord that the review UI is up, with the link. @mentions the user when
+    discord_mention_user_id is set so the message pings/badges instead of scrolling
+    by. NOTE: Discord still suppresses the mobile push while a desktop client is
+    running (even minimized to tray, even for mentions — tested); fully quit desktop
+    Discord to get the phone push. Retries 3×. Never raises."""
+    mention = getattr(config, "discord_mention_user_id", "")
+    prefix = f"<@{mention}> " if mention else ""
+    content = (f"{prefix}🖼️ **{show} Season {season}** is ripped and waiting for review:\n"
+               f"{url}\n"
+               f"Open from any device on the tailnet (phone/laptop need Tailscale on).")
+    payload = json.dumps({
+        "content": content,
+        # Explicitly allow the user ping — don't rely on webhook mention defaults.
+        "allowed_mentions": {"parse": ["users"]},
+    }).encode()
+
+    def do():
+        _post(
+            config.discord_webhook_url,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "ai-ripper/1.0",
+            },
+            body=payload,
+        )
+
+    _with_retry(do, DISCORD_RETRY_DELAYS, "Discord review-ready webhook")
+    log.info("Discord review-ready notification sent")
+
+
 def send_discord(titles: List[str], success: bool, config, error: str = "") -> None:
     """Send Discord webhook notification. Retries 3×. Never raises."""
     if success:

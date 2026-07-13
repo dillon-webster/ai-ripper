@@ -23,6 +23,7 @@ approval._extract_thumbnail) are instant and enough to spot a scramble/misID.
 import json
 import logging
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
-from modules import identify
+from modules import identify, notifier
 
 log = logging.getLogger(__name__)
 
@@ -93,9 +94,15 @@ def _episode_of(named_title: Dict) -> Optional[int]:
 
 def build_page_model(all_titles: List[Dict], named: List[Dict], dropped: List[Dict],
                      guide: List[Dict], show: str, season: int,
-                     thumbs_per_title: int = DEFAULT_THUMBS_PER_TITLE) -> Dict:
+                     thumbs_per_title: int = DEFAULT_THUMBS_PER_TITLE,
+                     nonce: Optional[str] = None) -> Dict:
     """JSON-able model the page renders from: every ripped title (kept AND dropped)
-    with its pipeline guess, plus the season's episode slots."""
+    with its pipeline guess, plus the season's episode slots.
+
+    `nonce` (fresh per call unless given) goes into every thumb URL so no two review
+    sessions ever share one — title indices and grab timestamps repeat across discs
+    of the same show, and the thumbs are served cacheable, so without it the browser
+    would happily show a previous disc's cached frame for the same URL."""
     named_by_idx = {t.get("title_index"): t for t in (named or [])}
     dropped_by_idx = {t.get("title_index"): t for t in (dropped or [])}
     guide_episodes = {e["index"] for e in guide}
@@ -132,6 +139,7 @@ def build_page_model(all_titles: List[Dict], named: List[Dict], dropped: List[Di
     return {
         "show": show,
         "season": season,
+        "nonce": nonce or secrets.token_hex(8),
         "episodes": [{"index": e["index"], "index_end": e.get("index_end"),
                       "name": e.get("name")} for e in guide],
         "titles": titles,
@@ -235,6 +243,25 @@ class _ThumbCache:
         return None
 
 
+def _advertised_host(config) -> str:
+    """Host to put in the review URL we log and send to Discord. Prefers the box's
+    Tailscale IP — that link opens from a phone/laptop anywhere, as long as the
+    device is on the tailnet — and falls back to the LAN hostname (home-network
+    only) when tailscale isn't installed/up. `review_ui_advertise_host` overrides
+    both (e.g. a MagicDNS name). Never raises."""
+    override = getattr(config, "review_ui_advertise_host", "")
+    if override:
+        return override
+    try:
+        result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
+                                text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return socket.gethostname()
+
+
 # ---------------------------------------------------------------------------
 # HTTP server (stdlib only — no new pip dependency)
 # ---------------------------------------------------------------------------
@@ -242,7 +269,7 @@ class _ThumbCache:
 class _ReviewState:
     """Shared between request_review and the handler threads."""
 
-    def __init__(self, all_titles, guide, show, season, page, thumbs):
+    def __init__(self, all_titles, guide, show, season, page, thumbs, nonce):
         self.all_titles = all_titles
         self.by_index = {t["title_index"]: t for t in all_titles}
         self.guide = guide
@@ -250,6 +277,7 @@ class _ReviewState:
         self.season = season
         self.page = page
         self.thumbs = thumbs
+        self.nonce = nonce
         self.outcome: Optional[List[Dict]] = None
         self.done = threading.Event()
         self.mu = threading.Lock()
@@ -267,6 +295,8 @@ def _make_handler(state: _ReviewState):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             if cacheable:
+                # Safe to cache hard: thumb URLs carry the per-session nonce, so a
+                # new disc's review never reuses an old URL.
                 self.send_header("Cache-Control", "max-age=86400")
             self.end_headers()
             try:
@@ -284,10 +314,16 @@ def _make_handler(state: _ReviewState):
                 self.send_error(404)
 
         def _thumb(self, parsed):
+            # /thumb/<nonce>/<idx> — a wrong nonce means a tab left over from an
+            # earlier disc's review session; 404 so its <img>s show as errored
+            # instead of silently getting this disc's frames.
+            parts = parsed.path.split("/")
+            if len(parts) != 4 or parts[2] != state.nonce:
+                return self.send_error(404, "stale or unknown review session")
             # Input hygiene: only spawn ffmpeg for a title we actually ripped.
             try:
-                idx = int(parsed.path.split("/")[2])
-            except (IndexError, ValueError):
+                idx = int(parts[3])
+            except ValueError:
                 return self.send_error(400, "bad title index")
             title = state.by_index.get(idx)
             if title is None:
@@ -346,22 +382,31 @@ def request_review(all_titles: List[Dict], named: List[Dict], dropped: List[Dict
         thumbs_per_title = getattr(config, "review_ui_thumbs_per_title",
                                    DEFAULT_THUMBS_PER_TITLE)
         thumb_dir = Path(config.temp_dir) / "review-thumbs"
+        # A killed run (Ctrl-C mid-review, power loss) skips the finally-cleanup, and
+        # the cache is keyed only (title_index, t) — wipe first or a leftover frame
+        # from the previous disc would be served as this one's.
+        shutil.rmtree(thumb_dir, ignore_errors=True)
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
         model = build_page_model(all_titles, named, dropped, guide, show, season,
                                  thumbs_per_title)
         state = _ReviewState(all_titles, guide, show, season,
-                             page=render_page(model), thumbs=_ThumbCache(thumb_dir))
+                             page=render_page(model), thumbs=_ThumbCache(thumb_dir),
+                             nonce=model["nonce"])
 
         # 0.0.0.0 = the rip-box's own interfaces (tailnet-reachable), NOT public.
         server = ThreadingHTTPServer(("0.0.0.0", port), _make_handler(state))
         bound_port = server.server_address[1]
         threading.Thread(target=server.serve_forever, daemon=True,
                          name="review-ui").start()
-        host = socket.gethostname()
-        log.info(f"Review UI up: http://{host}:{bound_port}/ (use the rip-box's "
-                 f"Tailscale name from other devices). Waiting up to {timeout}s "
-                 "for the curated mapping…")
+        host = _advertised_host(config)
+        url = f"http://{host}:{bound_port}/"
+        log.info(f"Review UI up: {url} — waiting up to {timeout}s for the "
+                 "curated mapping…")
+        # Ping Discord with the link — the user usually isn't at a desk when the
+        # rip finishes. (Phone push requires desktop Discord to be fully quit;
+        # see notifier.send_review_ready.)
+        notifier.send_review_ready(url, show, season, config)
         if _on_start:
             _on_start(host, bound_port)
 
@@ -476,6 +521,10 @@ footer { position:fixed; bottom:0; left:0; right:0; background:#1d2026; padding:
 <script>
 'use strict';
 const MODEL = __MODEL_JSON__;
+// Session nonce in every thumb URL: title indices/timestamps repeat across discs,
+// and thumbs are served cacheable — this keeps the browser from reusing a cached
+// frame from a previous disc's review.
+const THUMB = '/thumb/' + MODEL.nonce + '/';
 const $ = s => document.querySelector(s);
 const slotsEl = $('#slots'), titlesEl = $('#titles'), msgEl = $('#msg'), submitBtn = $('#submit');
 
@@ -514,7 +563,7 @@ MODEL.titles.forEach(t => {
   strip.className = 'strip';
   t.thumbs.forEach(ts => {
     const img = document.createElement('img');
-    img.dataset.src = '/thumb/' + t.title_index + '?t=' + ts;
+    img.dataset.src = THUMB + t.title_index + '?t=' + ts;
     img.alt = 't=' + ts + 's';
     img.title = fmtDur(ts);
     img.addEventListener('click', () => openLightbox(t, ts));
@@ -603,7 +652,7 @@ let lb = null;  // { title, t }
 const lbEl = $('#lightbox'), lbImg = $('#lb-img'), lbTime = $('#lb-time');
 function openLightbox(t, ts) { lb = { title: t, t: ts }; lbEl.classList.add('open'); lbShow(); }
 function lbShow() {
-  lbImg.src = '/thumb/' + lb.title.title_index + '?t=' + lb.t;
+  lbImg.src = THUMB + lb.title.title_index + '?t=' + lb.t;
   lbTime.textContent = lb.title.name + ' @ ' + fmtDur(lb.t);
 }
 function lbStep(delta) {
