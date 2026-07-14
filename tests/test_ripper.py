@@ -140,6 +140,63 @@ def test_rip_prunes_full_length_bonus_by_source_set(tmp_path):
     assert "3" not in ripped  # and never even ripped
 
 
+def test_rip_skips_titles_over_max_title_secs(tmp_path):
+    # 3 real ~22-min episodes + a 44-min two-episode 'Play All' chunk. The
+    # sum-of-others heuristic can't see it (44 min is nowhere near the other
+    # 65 min combined), so the episode-guide cap must skip it BEFORE ripping —
+    # not rip it for an hour and drop it post-rip.
+    info_output = (
+        'TINFO:0,9,0,"0:21:45"\n'
+        'TINFO:1,9,0,"0:22:12"\n'
+        'TINFO:2,9,0,"0:21:38"\n'
+        'TINFO:3,9,0,"0:44:00"\n'
+    )
+    for name in ("title_t00.mkv", "title_t01.mkv", "title_t02.mkv"):
+        (tmp_path / name).write_bytes(b"x")
+
+    ripped = []
+
+    def fake_run(cmd, **kwargs):
+        mock = MagicMock()
+        mock.returncode = 0
+        if "info" in cmd:
+            mock.stdout = info_output
+        elif "mkv" in cmd:
+            ripped.append(cmd[3])  # title-index argument to `makemkvcon mkv`
+        return mock
+
+    with patch("modules.ripper.subprocess.run", side_effect=fake_run):
+        titles = rip(Path("/Volumes/FAKE_DISC"), tmp_path, max_title_secs=1998)  # 1332s × 1.5
+
+    assert sorted(t["title_index"] for t in titles) == [0, 1, 2]
+    assert "3" not in ripped  # the Play-All chunk was never ripped
+
+
+def test_rip_keeps_long_title_without_cap(tmp_path):
+    # Same disc, but no episode guide → no cap: the 44-min title still rips
+    # (old behavior preserved; the post-rip content-ID filter handles it).
+    info_output = (
+        'TINFO:0,9,0,"0:21:45"\n'
+        'TINFO:1,9,0,"0:22:12"\n'
+        'TINFO:2,9,0,"0:21:38"\n'
+        'TINFO:3,9,0,"0:44:00"\n'
+    )
+    for i in range(4):
+        (tmp_path / f"title_t0{i}.mkv").write_bytes(b"x")
+
+    def fake_run(cmd, **kwargs):
+        mock = MagicMock()
+        mock.returncode = 0
+        if "info" in cmd:
+            mock.stdout = info_output
+        return mock
+
+    with patch("modules.ripper.subprocess.run", side_effect=fake_run):
+        titles = rip(Path("/Volumes/FAKE_DISC"), tmp_path)
+
+    assert sorted(t["title_index"] for t in titles) == [0, 1, 2, 3]
+
+
 def test_rip_filters_sub_16min_bonus(tmp_path):
     # A 15:09 (909s) featurette is below the 960s floor and must be dropped.
     info_output = (

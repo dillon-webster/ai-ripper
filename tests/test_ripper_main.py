@@ -99,6 +99,49 @@ def test_main_loop_drops_movie_extras_before_transfer(tmp_path):
     )
 
 
+def test_main_loop_fetches_guide_before_rip_and_caps_title_length(tmp_path):
+    """The episode guide is fetched BEFORE ripping so its longest runtime (×1.5)
+    caps rip-time title length — Play-All titles are skipped, not ripped+dropped."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    named_titles = _make_named_titles(tmp_path)
+    guide = [
+        {"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404},
+        {"index": 2, "index_end": None, "name": "Diversity Day", "runtime_secs": 1332},
+    ]
+    order = []
+
+    def fake_guide(*args, **kwargs):
+        order.append("guide")
+        return guide
+
+    def fake_rip(*args, **kwargs):
+        order.append("rip")
+        return raw_titles
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", side_effect=fake_rip) as mock_rip, \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", side_effect=fake_guide), \
+         patch("ripper.namer.identify", return_value=named_titles), \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]), \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=1, show="The Office")
+
+    assert order == ["guide", "rip"]
+    assert mock_rip.call_args.kwargs["max_title_secs"] == 2106  # 1404s × 1.5
+
+
 def test_main_loop_uses_content_id_when_enabled(tmp_path):
     """With --content-id, naming comes from identify.name_by_content (guide-matched),
     not the legacy playback-order namer."""

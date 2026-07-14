@@ -112,11 +112,34 @@ def main(season: int = None, disc: int = None, show: str = None,
         # handling, mirroring --dry-run. Reset per disc, read in the finally block.
         held = False
         try:
+            # Fetch the real episode list BEFORE ripping when we know the show + season.
+            # It serves two jobs: (1) the namer is constrained to episodes that actually
+            # exist (no phantom S01E07-E08 on a 6-episode season, no invented ranges);
+            # (2) its longest runtime caps rip-time title length, so 'Play All'/omnibus
+            # titles are skipped up front instead of ripped for an hour and then dropped.
+            # Degrade gracefully: if the lookup fails, rip+name without it (old behavior).
+            guide = None
+            if show and season is not None:
+                try:
+                    guide = episode_guide.get_season_episodes(show, season, config)
+                    log.info(f"Episode guide: {len(guide)} episode(s) for '{show}' S{season:02d}")
+                except EpisodeGuideError as e:
+                    log.warning(f"Episode guide lookup failed ({e}); naming without it")
+
+            # A title longer than the longest real episode × the omnibus factor can't BE
+            # a single episode — don't rip it at all. (Double-length episodes are safe:
+            # their guide runtime is itself ~2×, so they raise the cap.)
+            max_title_secs = None
+            if guide:
+                runtimes = [e["runtime_secs"] for e in guide if e.get("runtime_secs")]
+                if runtimes:
+                    max_title_secs = int(max(runtimes) * identify.OMNIBUS_RUNTIME_FACTOR)
+
             # Duration-based dedup is DISABLED: many box sets give every disc the
             # same volume label (e.g. "FRIENDS_SERIES_3"), so matching titles by
             # length across discs silently skipped real episodes. Rip every title;
             # the namer handles numbering. (Revisit only with a whole-disc fingerprint.)
-            titles = disc_ripper.rip(volume_path, config.temp_dir)
+            titles = disc_ripper.rip(volume_path, config.temp_dir, max_title_secs=max_title_secs)
             log.info(f"Ripped {len(titles)} title(s)")
 
             if not titles:
@@ -125,18 +148,6 @@ def main(season: int = None, disc: int = None, show: str = None,
                 continue
 
             existing = transfer.list_existing_episodes(config)
-
-            # Fetch the real episode list from Jellyfin when we know the show + season,
-            # so the namer is constrained to episodes that actually exist (no phantom
-            # S01E07-E08 on a 6-episode season) and won't invent double-episode ranges.
-            # Degrade gracefully: if the lookup fails, name without it (old behavior).
-            guide = None
-            if show and season is not None:
-                try:
-                    guide = episode_guide.get_season_episodes(show, season, config)
-                    log.info(f"Episode guide: {len(guide)} episode(s) for '{show}' S{season:02d}")
-                except EpisodeGuideError as e:
-                    log.warning(f"Episode guide lookup failed ({e}); naming without it")
 
             # Content-based identification (Phase 2) is the real fix for scrambled disc
             # order: it names each title by what it CONTAINS, not by playback position.
