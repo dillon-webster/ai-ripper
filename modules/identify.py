@@ -44,6 +44,17 @@ MODEL = "claude-opus-4-8"
 # Chosen over vobsubocr, whose Rust leptonica bindings won't build on leptonica 1.86.
 OCR_CMD = "vobsub2srt"
 
+# Subtitle tracks come in two flavors and need different extraction:
+#   TEXT (subrip/ass/mov_text/…): dialogue is already text — ffmpeg transcodes the
+#     track straight to SRT, no OCR. Most animated releases (e.g. The Legend of Korra)
+#     ship these; extracting them as if they were VobSub silently failed and forced the
+#     far weaker frame fallback on every title.
+#   IMAGE (DVD VobSub, Blu-ray PGS): bitmaps mkvextract dumps as an .idx/.sub pair that
+#     vobsub2srt then OCRs. Most live-action DVDs ship these.
+# codec_name comes from ffprobe. Unknown codecs default to the OCR path (the old
+# behavior), so nothing that worked before regresses.
+_TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+
 # Subtitle dialogue is sampled from several points spread ACROSS the episode, not
 # just the opening. Episodes in a serialized arc (S10 Friends' adoption→birth-mother→
 # finale run) open with near-identical dialogue, so the first ~2 min can't tell them
@@ -264,11 +275,12 @@ def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
 
 
-def _find_subtitle_track(mkv_path: Path) -> Optional[int]:
-    """Return the stream index of the first subtitle track, or None. Uses ffprobe."""
+def _find_subtitle_track(mkv_path: Path) -> Optional[tuple]:
+    """Return (stream_index, codec_name) of the first subtitle track, or None. Uses
+    ffprobe. codec_name selects the extraction path (text transcode vs. VobSub OCR)."""
     result = _run([
         "ffprobe", "-v", "error", "-select_streams", "s",
-        "-show_entries", "stream=index", "-of", "json", str(mkv_path),
+        "-show_entries", "stream=index,codec_name", "-of", "json", str(mkv_path),
     ])
     if result.returncode != 0:
         log.warning(f"ffprobe failed on {mkv_path.name}: {result.stderr.strip()}")
@@ -277,7 +289,9 @@ def _find_subtitle_track(mkv_path: Path) -> Optional[int]:
         streams = json.loads(result.stdout).get("streams", [])
     except json.JSONDecodeError:
         return None
-    return streams[0]["index"] if streams else None
+    if not streams:
+        return None
+    return streams[0]["index"], streams[0].get("codec_name", "")
 
 
 def _parse_srt_cues(srt_text: str) -> List[tuple]:
@@ -328,17 +342,25 @@ def _srt_dialogue(srt_text: str) -> str:
     return " ".join(out)[:SUBTITLE_MAX_CHARS]
 
 
-def extract_subtitle_text(mkv_path: Path) -> Optional[str]:
-    """Extract + OCR the main subtitle track, then sample dialogue across the episode.
+def _extract_text_srt(mkv_path: Path, track: int) -> Optional[str]:
+    """Transcode a TEXT subtitle track (subrip/ass/mov_text/…) to SRT with ffmpeg and
+    return the SRT text. No OCR — the dialogue is already text. ffmpeg's srt muxer
+    normalizes every text format to the SRT `_parse_srt_cues` expects."""
+    with tempfile.TemporaryDirectory() as td:
+        srt = Path(td) / "subs.srt"
+        result = _run(["ffmpeg", "-y", "-i", str(mkv_path),
+                       "-map", f"0:{track}", str(srt)])
+        if result.returncode != 0 or not srt.exists():
+            log.warning(f"ffmpeg subtitle extract failed on {mkv_path.name}: "
+                        f"{result.stderr.strip()[:200]}")
+            return None
+        return srt.read_text(errors="replace")
 
-    DVD subs are image-based VobSub: mkvextract pulls the .idx/.sub pair, vobsub2srt
-    runs Tesseract to produce an .srt for the whole track, from which `_srt_dialogue`
-    samples spread-out windows. Returns None (caller falls back to frames) if there's
-    no subtitle track, a tool is missing, or OCR yields nothing usable.
-    """
-    track = _find_subtitle_track(mkv_path)
-    if track is None:
-        return None
+
+def _ocr_vobsub(mkv_path: Path, track: int) -> Optional[str]:
+    """Extract an IMAGE subtitle track (VobSub) and OCR it to SRT text. mkvextract
+    pulls the .idx/.sub pair; vobsub2srt runs Tesseract to produce <base>.srt.
+    Returns None if mkvextract/OCR fails or the toolchain is missing."""
     with tempfile.TemporaryDirectory() as td:
         base = Path(td) / "subs"
         idx = f"{base}.idx"  # mkvextract writes the .idx + companion .sub pair
@@ -355,11 +377,33 @@ def extract_subtitle_text(mkv_path: Path) -> Optional[str]:
                 return None
             if not srt.exists():
                 return None
-            dialogue = _srt_dialogue(srt.read_text(errors="replace"))
+            return srt.read_text(errors="replace")
         except FileNotFoundError as e:
             log.warning(f"OCR toolchain missing ({e}); falling back to frames")
             return None
-    return dialogue or None
+
+
+def extract_subtitle_text(mkv_path: Path) -> Optional[str]:
+    """Extract the main subtitle track to SRT and sample dialogue across the episode.
+
+    Dispatches on codec: TEXT tracks (subrip/ass/…) are transcoded directly with
+    ffmpeg (no OCR); IMAGE tracks (VobSub) go through mkvextract + vobsub2srt OCR.
+    `_srt_dialogue` then samples spread-out windows from the resulting SRT. Returns
+    None (caller falls back to frames) if there's no subtitle track, a tool is
+    missing/fails, or extraction yields nothing usable.
+    """
+    found = _find_subtitle_track(mkv_path)
+    if found is None:
+        return None
+    track, codec = found
+    if codec in _TEXT_SUB_CODECS:
+        srt_text = _extract_text_srt(mkv_path, track)
+    else:
+        # VobSub, PGS, or an unknown codec → OCR path (preserves prior behavior).
+        srt_text = _ocr_vobsub(mkv_path, track)
+    if not srt_text:
+        return None
+    return _srt_dialogue(srt_text) or None
 
 
 def extract_frames(mkv_path: Path, out_dir: Path,

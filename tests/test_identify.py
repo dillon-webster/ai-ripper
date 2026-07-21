@@ -160,6 +160,77 @@ def test_srt_dialogue_uses_whole_short_track():
     assert _srt_dialogue(srt) == "Line one Line two"
 
 
+# --- subtitle extraction: text vs. image dispatch ---------------------------
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _ffprobe_sub(codec):
+    return _completed(stdout=f'{{"streams": [{{"index": 4, "codec_name": "{codec}"}}]}}')
+
+
+def test_find_subtitle_track_returns_index_and_codec():
+    with patch.object(identify, "_run", return_value=_ffprobe_sub("subrip")):
+        assert identify._find_subtitle_track(Path("x.mkv")) == (4, "subrip")
+
+
+def test_find_subtitle_track_none_when_no_subtitle_stream():
+    with patch.object(identify, "_run", return_value=_completed(stdout='{"streams": []}')):
+        assert identify._find_subtitle_track(Path("x.mkv")) is None
+
+
+def test_extract_subtitle_text_uses_ffmpeg_for_text_track():
+    # A subrip (text) track — Korra's case — must transcode with ffmpeg, NOT OCR.
+    # Regression: the old code sent every track through vobsub2srt, which failed on
+    # text tracks and forced the frame fallback on every episode.
+    srt = "1\n00:00:01,000 --> 00:00:04,000\nTenzin: Earth. Fire. Air.\n"
+
+    def fake_extract_text(mkv_path, track):
+        assert track == 4
+        return srt
+
+    with patch.object(identify, "_find_subtitle_track", return_value=(4, "subrip")), \
+         patch.object(identify, "_extract_text_srt", side_effect=fake_extract_text) as text, \
+         patch.object(identify, "_ocr_vobsub") as ocr:
+        dialogue = identify.extract_subtitle_text(Path("korra.mkv"))
+
+    assert "Tenzin: Earth. Fire. Air." in dialogue
+    text.assert_called_once()
+    ocr.assert_not_called()  # never touches the OCR path for a text track
+
+
+def test_extract_subtitle_text_uses_ocr_for_vobsub_track():
+    # A DVD VobSub (image) track still goes through mkvextract + vobsub2srt OCR.
+    srt = "1\n00:00:01,000 --> 00:00:04,000\nMichael: that's what she said\n"
+    with patch.object(identify, "_find_subtitle_track", return_value=(3, "dvd_subtitle")), \
+         patch.object(identify, "_ocr_vobsub", return_value=srt) as ocr, \
+         patch.object(identify, "_extract_text_srt") as text:
+        dialogue = identify.extract_subtitle_text(Path("office.mkv"))
+
+    assert "that's what she said" in dialogue
+    ocr.assert_called_once()
+    text.assert_not_called()
+
+
+def test_extract_subtitle_text_ocr_path_for_unknown_codec():
+    # Unknown codec defaults to OCR (prior behavior) rather than being dropped.
+    with patch.object(identify, "_find_subtitle_track", return_value=(3, "hdmv_pgs_subtitle")), \
+         patch.object(identify, "_ocr_vobsub", return_value=None) as ocr:
+        assert identify.extract_subtitle_text(Path("bluray.mkv")) is None
+    ocr.assert_called_once()
+
+
+def test_extract_subtitle_text_none_when_no_track():
+    with patch.object(identify, "_find_subtitle_track", return_value=None):
+        assert identify.extract_subtitle_text(Path("x.mkv")) is None
+
+
+def test_extract_text_srt_returns_none_on_ffmpeg_failure():
+    with patch.object(identify, "_run", return_value=_completed(returncode=1, stderr="boom")):
+        assert identify._extract_text_srt(Path("x.mkv"), 4) is None
+
+
 # --- reconcile rules --------------------------------------------------------
 
 def _t(idx, episode, dur, **extra):
