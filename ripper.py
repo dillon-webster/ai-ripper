@@ -201,11 +201,20 @@ def main(season: int = None, disc: int = None, show: str = None,
                 log.info(f"DRY RUN — temp files kept in {config.temp_dir}; disc not ejected.")
                 return
 
+            # --review-ui curates TV episode slots; a movie disc has none (no show,
+            # season, or episode guide), so the review page would have nothing to
+            # assign. Skip it for movies and transfer the namer's result directly —
+            # still honoring --approve below if that was also passed.
+            disc_is_movie = any(t.get("media_type") == "movie" for t in named)
+            if review_ui and disc_is_movie:
+                log.info("--review-ui applies to TV episode slots only; this is a "
+                         "movie disc — skipping review and transferring the namer's result.")
+
             # Web review UI (--review-ui): the user hand-curates the full mapping in
             # the browser — every ripped title (kept AND dropped) can be reassigned,
             # added back, or excluded. Takes the place of the Discord approval gate
             # for this run; decline/timeout/failure HOLDS exactly like --approve.
-            if review_ui:
+            if review_ui and not disc_is_movie:
                 if approve:
                     log.info("--review-ui supersedes --approve this run — Discord approval skipped.")
                 decision = review_ui_mod.request_review(

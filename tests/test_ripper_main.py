@@ -434,6 +434,54 @@ def test_main_loop_review_ui_holds_files_on_timeout(tmp_path):
     assert mock_discord.call_args.kwargs["success"] is False
 
 
+def test_main_loop_review_ui_skips_movie_disc_and_transfers(tmp_path):
+    """A movie disc has no episode slots to curate, so --review-ui is skipped: the
+    review server is never launched and the namer's feature transfers directly."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "INCEPTION"
+    disc_path.mkdir()
+
+    raw_titles = [
+        {"path": disc_path / "title_t00.mkv", "duration_secs": 6127, "title_index": 0},
+        {"path": disc_path / "title_t01.mkv", "duration_secs": 300, "title_index": 1},
+    ]
+    feature = {
+        "path": tmp_path / "title_t00.mkv", "duration_secs": 6127, "title_index": 0,
+        "jellyfin_filename": "Inception.2010.mkv", "media_type": "movie",
+        "destination": "movies", "is_extra": False,
+    }
+    trailer = {
+        "path": tmp_path / "title_t01.mkv", "duration_secs": 300, "title_index": 1,
+        "jellyfin_filename": "Inception.2010.Trailer.mkv", "media_type": "movie",
+        "destination": "movies", "is_extra": True,
+    }
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("INCEPTION", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.namer.identify", return_value=[feature, trailer]), \
+         patch("ripper.review_ui_mod.request_review") as mock_review, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]) as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord") as mock_discord, \
+         patch("ripper.cleanup_temp") as mock_cleanup, \
+         patch("ripper.eject_disc") as mock_eject:
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(review_ui=True)
+
+    mock_review.assert_not_called()  # no review page for a movie
+    sent = mock_send.call_args[0][0]
+    assert [t["jellyfin_filename"] for t in sent] == ["Inception.2010.mkv"]
+    mock_discord.assert_called_once_with(
+        ["Inception.2010.mkv"], success=True, config=config
+    )
+    mock_cleanup.assert_called_once()  # transferred run cleans up + ejects normally
+    mock_eject.assert_called_once()
+
+
 def test_main_loop_review_ui_supersedes_approve(tmp_path):
     """When both flags are passed, the web review runs and the Discord approval
     gate is skipped for the run."""
