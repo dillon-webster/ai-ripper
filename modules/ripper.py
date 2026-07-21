@@ -89,12 +89,16 @@ def _parse_title_index(filename: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def rip(volume_path: Path, temp_dir: Path) -> List[Dict]:
+def rip(volume_path: Path, temp_dir: Path, max_title_secs: int = None) -> List[Dict]:
     """
     Rip eligible titles from the disc to temp_dir.
     Returns list of dicts: [{path, duration_secs, title_index}].
     Titles below MIN_TITLE_DURATION_SECS are excluded BEFORE ripping (skips
     menus/extras), as is the TV "Play All" combined title.
+    max_title_secs (from the episode guide: longest real episode × omnibus factor)
+    also excludes over-long titles BEFORE ripping — a title no single episode can
+    fill is a 'Play All'/omnibus chunk, and ripping one wastes an hour just to
+    drop it post-rip. Titles with unknown duration are never excluded by it.
     Raises RipError on failure.
     """
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -129,6 +133,9 @@ def rip(volume_path: Path, temp_dir: Path) -> List[Dict]:
             eligible_indices.append(idx)
         elif dur < MIN_TITLE_DURATION_SECS:
             log.info(f"Skipping title #{idx} (duration {dur}s < {MIN_TITLE_DURATION_SECS}s — extra/menu)")
+        elif max_title_secs and dur > max_title_secs:
+            log.info(f"Skipping title #{idx} (duration {dur}s > {max_title_secs}s — "
+                     "longer than any episode, 'Play All'/omnibus)")
         else:
             eligible_indices.append(idx)
 

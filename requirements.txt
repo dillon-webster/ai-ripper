@@ -1,3 +1,4 @@
 anthropic
 python-dotenv
+discord.py
 pytest

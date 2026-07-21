@@ -2,11 +2,11 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 from config import Config
-from modules.notifier import trigger_jellyfin_scan, send_discord
+from modules.notifier import trigger_jellyfin_scan, send_discord, send_review_ready
 
 
-def _make_config():
-    return Config(
+def _make_config(**over):
+    base = dict(
         anthropic_api_key="",
         server_ip="",
         server_user="",
@@ -16,6 +16,8 @@ def _make_config():
         temp_dir=Path("/tmp"),
         media_root="/media",
     )
+    base.update(over)
+    return Config(**base)
 
 
 def test_trigger_jellyfin_scan_posts_to_correct_url():
@@ -83,6 +85,44 @@ def test_send_discord_failure_message_contains_error():
     body = json.loads(req.data.decode())
     assert "❌" in body["content"]
     assert "makemkvcon crashed" in body["content"]
+
+
+def test_send_review_ready_mentions_user_and_carries_link():
+    config = _make_config(discord_mention_user_id="123456789")
+    with patch("modules.notifier.urllib.request.urlopen") as mock_urlopen:
+        send_review_ready("http://100.64.0.7:8765/", "The Office", 2, config)
+
+    mock_urlopen.assert_called_once()
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == "https://discord.com/api/webhooks/test"
+    import json
+    body = json.loads(req.data.decode())
+    assert "<@123456789>" in body["content"]
+    assert "http://100.64.0.7:8765/" in body["content"]
+    assert "The Office" in body["content"]
+    # The ping must be explicitly allowed or Discord may swallow the mention.
+    assert body["allowed_mentions"] == {"parse": ["users"]}
+
+
+def test_send_review_ready_without_mention_id_sends_no_mention():
+    config = _make_config()  # discord_mention_user_id defaults to ""
+    with patch("modules.notifier.urllib.request.urlopen") as mock_urlopen:
+        send_review_ready("http://100.64.0.7:8765/", "The Office", 2, config)
+
+    import json
+    body = json.loads(mock_urlopen.call_args[0][0].data.decode())
+    assert "<@" not in body["content"]
+    assert "http://100.64.0.7:8765/" in body["content"]
+
+
+def test_send_review_ready_does_not_raise_after_all_retries_fail():
+    config = _make_config()
+    import urllib.error
+
+    with patch("modules.notifier.urllib.request.urlopen",
+               side_effect=urllib.error.URLError("timeout")), \
+         patch("modules.notifier.time.sleep"):
+        send_review_ready("http://x:8765/", "The Office", 2, config)  # Must not raise
 
 
 def test_send_discord_does_not_raise_after_all_retries_fail():

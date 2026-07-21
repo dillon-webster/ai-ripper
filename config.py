@@ -15,6 +15,30 @@ class Config:
     discord_webhook_url: str
     temp_dir: Path
     media_root: str
+    # Phase 3 (Discord approval gate) — optional; blank ⇒ the --approve gate can't
+    # run and holds files instead of transferring. The one-way webhook above stays
+    # for success/failure notifications.
+    discord_bot_token: str = ""
+    discord_channel_id: str = ""
+    # Optional: a Discord user ID to @mention in the approval message. A direct
+    # mention pushes to your phone even when you're active on desktop (Discord
+    # otherwise suppresses the mobile push). Blank ⇒ no mention.
+    discord_mention_user_id: str = ""
+    approval_timeout_secs: int = 1800
+    # Web review UI (--review-ui): local curation page served from the rip-box,
+    # reachable over the tailnet only — never expose the port to the internet.
+    review_ui_port: int = 8765
+    review_ui_timeout_secs: int = 1800
+    review_ui_thumbs_per_title: int = 12
+    # Host to advertise in the review URL (logs + Discord ping). Blank ⇒ the box's
+    # Tailscale IP when available (reachable from a phone/laptop anywhere on the
+    # tailnet), else the LAN hostname (home network only). Set explicitly to e.g.
+    # the machine's MagicDNS name if you prefer a stable readable URL.
+    review_ui_advertise_host: str = ""
+    # TMDB is the preferred episode-guide source: it has every season's episode list
+    # (names + overviews + runtimes) whether or not it's been ripped yet, unlike
+    # Jellyfin which only knows seasons already in your library. Blank ⇒ use Jellyfin.
+    tmdb_api_key: str = ""
 
 
 def load_config() -> Config:
@@ -43,4 +67,13 @@ def load_config() -> Config:
         discord_webhook_url=os.environ["DISCORD_WEBHOOK_URL"],
         temp_dir=Path(os.environ["TEMP_DIR"]),
         media_root=os.environ["MEDIA_ROOT"],
+        discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", ""),
+        discord_channel_id=os.getenv("DISCORD_CHANNEL_ID", ""),
+        discord_mention_user_id=os.getenv("DISCORD_MENTION_USER_ID", ""),
+        approval_timeout_secs=int(os.getenv("APPROVAL_TIMEOUT_SECS", "1800")),
+        review_ui_port=int(os.getenv("REVIEW_UI_PORT", "8765")),
+        review_ui_timeout_secs=int(os.getenv("REVIEW_UI_TIMEOUT_SECS", "1800")),
+        review_ui_thumbs_per_title=int(os.getenv("REVIEW_UI_THUMBS_PER_TITLE", "12")),
+        review_ui_advertise_host=os.getenv("REVIEW_UI_ADVERTISE_HOST", ""),
+        tmdb_api_key=os.getenv("TMDB_API_KEY", ""),
     )
