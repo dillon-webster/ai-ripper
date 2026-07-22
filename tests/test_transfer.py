@@ -1,8 +1,11 @@
 import pytest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 from config import Config
-from modules.transfer import send_all, TransferError, _remote_subpath, _remote_file_exists
+from modules.transfer import (
+    send_all, stage_local, TransferError, _remote_subpath, _remote_file_exists,
+)
 
 
 def _make_config():
@@ -107,3 +110,84 @@ def test_send_all_raises_after_all_retries_fail(tmp_path):
          patch("modules.transfer.time.sleep"):
         with pytest.raises(TransferError, match="Friends.S01E01.mkv"):
             send_all(titles, config)
+
+
+def _make_movie_titled(tmp_path):
+    f = tmp_path / "title_t00.mkv"
+    f.write_bytes(b"data")
+    return [{
+        "path": f,
+        "duration_secs": 8400,
+        "title_index": 0,
+        "jellyfin_filename": "Inception.2010.mkv",
+        "media_type": "movie",
+        "destination": "movies",
+    }]
+
+
+def test_stage_local_moves_movie_to_staging_movies_dir(tmp_path):
+    staging = tmp_path / "staging"
+    titles = _make_movie_titled(tmp_path)
+    src = titles[0]["path"]
+    config = replace(_make_config(), bluray_staging_dir=str(staging))
+
+    result = stage_local(titles, config)
+
+    dest = staging / "movies" / "Inception.2010.mkv"
+    assert result == [dest]
+    assert dest.exists()
+    assert not src.exists()  # moved, not copied
+    assert dest.read_bytes() == b"data"
+
+
+def test_stage_local_moves_tv_to_season_layout(tmp_path):
+    staging = tmp_path / "staging"
+    titles = _make_titled(tmp_path)  # Friends.S01E01.mkv, tv/tvshows
+    config = replace(_make_config(), bluray_staging_dir=str(staging))
+
+    result = stage_local(titles, config)
+
+    dest = staging / "tvshows" / "Friends" / "Season 01" / "Friends.S01E01.mkv"
+    assert result == [dest]
+    assert dest.exists()
+
+
+def test_stage_local_expands_user_home(tmp_path):
+    titles = _make_movie_titled(tmp_path)
+    config = replace(_make_config(), bluray_staging_dir="~/video-transfer")
+
+    with patch("modules.transfer.shutil.move") as mock_move, \
+         patch("pathlib.Path.mkdir"), patch("pathlib.Path.exists", return_value=False):
+        stage_local(titles, config)
+
+    dest_arg = Path(mock_move.call_args[0][1])
+    assert "~" not in str(dest_arg)
+    assert str(dest_arg).endswith("video-transfer/movies/Inception.2010.mkv")
+
+
+def test_stage_local_skips_when_already_staged(tmp_path):
+    staging = tmp_path / "staging"
+    titles = _make_movie_titled(tmp_path)
+    src = titles[0]["path"]
+    dest = staging / "movies" / "Inception.2010.mkv"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"existing")
+    config = replace(_make_config(), bluray_staging_dir=str(staging))
+
+    with patch("modules.transfer.shutil.move") as mock_move:
+        result = stage_local(titles, config)
+
+    mock_move.assert_not_called()
+    assert result == []
+    assert src.exists()  # source left in place for normal cleanup
+    assert dest.read_bytes() == b"existing"  # not overwritten
+
+
+def test_stage_local_raises_transfer_error_on_move_failure(tmp_path):
+    staging = tmp_path / "staging"
+    titles = _make_movie_titled(tmp_path)
+    config = replace(_make_config(), bluray_staging_dir=str(staging))
+
+    with patch("modules.transfer.shutil.move", side_effect=OSError("No space left on device")):
+        with pytest.raises(TransferError, match="Inception.2010.mkv"):
+            stage_local(titles, config)

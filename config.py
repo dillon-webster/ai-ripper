@@ -39,6 +39,11 @@ class Config:
     # (names + overviews + runtimes) whether or not it's been ripped yet, unlike
     # Jellyfin which only knows seasons already in your library. Blank ⇒ use Jellyfin.
     tmdb_api_key: str = ""
+    # Blu-ray staging root on THIS machine. Blu-ray rips (20-40GB+ raw) land here
+    # under the same movies/ and tvshows/ layout the server uses, so they can be
+    # encoded/compressed before being copied to the server manually. DVDs bypass
+    # this and transfer straight to the server. '~' is expanded at use.
+    bluray_staging_dir: str = "~/video-transfer"
 
 
 def load_config() -> Config:
@@ -76,4 +81,5 @@ def load_config() -> Config:
         review_ui_thumbs_per_title=int(os.getenv("REVIEW_UI_THUMBS_PER_TITLE", "12")),
         review_ui_advertise_host=os.getenv("REVIEW_UI_ADVERTISE_HOST", ""),
         tmdb_api_key=os.getenv("TMDB_API_KEY", ""),
+        bluray_staging_dir=os.getenv("BLURAY_STAGING_DIR", "~/video-transfer"),
     )

@@ -99,6 +99,46 @@ def test_main_loop_drops_movie_extras_before_transfer(tmp_path):
     )
 
 
+def test_main_loop_stages_bluray_locally_instead_of_transferring(tmp_path):
+    """A Blu-ray disc (BDMV/) is staged to the local staging dir for encoding —
+    NOT sent to the server, and no Jellyfin scan is triggered. The Discord notice
+    is the staged variant."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "INCEPTION_BLURAY"
+    disc_path.mkdir()
+    (disc_path / "BDMV").mkdir()  # marks it as a Blu-ray
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 8400, "title_index": 0}]
+    movie = {
+        "path": tmp_path / "title_t00.mkv", "duration_secs": 8400, "title_index": 0,
+        "jellyfin_filename": "Inception.2010.mkv", "media_type": "movie",
+        "destination": "movies", "is_extra": False,
+    }
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("INCEPTION_BLURAY", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.namer.identify", return_value=[movie]), \
+         patch("ripper.transfer.stage_local", return_value=[tmp_path / "staged.mkv"]) as mock_stage, \
+         patch("ripper.transfer.send_all") as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan") as mock_scan, \
+         patch("ripper.notifier.send_discord") as mock_discord, \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main()
+
+    mock_stage.assert_called_once()
+    mock_send.assert_not_called()          # never touches the server
+    mock_scan.assert_not_called()          # nothing to scan on the server
+    mock_discord.assert_called_once_with(
+        ["Inception.2010.mkv"], success=True, config=config, staged=True
+    )
+
+
 def test_main_loop_fetches_guide_before_rip_and_caps_title_length(tmp_path):
     """The episode guide is fetched BEFORE ripping so its longest runtime (×1.5)
     caps rip-time title length — Play-All titles are skipped, not ripped+dropped."""

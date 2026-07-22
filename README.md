@@ -17,9 +17,15 @@ The daemon loops forever, one disc at a time (`ripper.py`):
 4. **Name** — turns each anonymous title into a Jellyfin filename like
    `Friends.S01E01.mkv`. Two strategies (see below)
 5. **Review / approve** — optional human gate before anything is written
-6. **Transfer** — SCPs the named files to the server (`modules/transfer.py`)
-7. **Notify** — triggers a Jellyfin library scan and sends a Discord message
-   (`modules/notifier.py`)
+6. **Transfer** — routed by disc type (`modules/transfer.py`):
+   - **DVD** → SCPs the named files straight to the server.
+   - **Blu-ray** → *staged locally* to `BLURAY_STAGING_DIR` (default `~/video-transfer`)
+     under the same `movies/` and `tvshows/` layout, so you can encode/compress the
+     20-40GB+ raw rips before copying them to the server. Detected automatically from
+     the disc structure (`BDMV` vs `VIDEO_TS`) — no flag to pass.
+7. **Notify** — for a DVD, triggers a Jellyfin library scan and sends a Discord
+   message; for a staged Blu-ray, sends a "ripped and staged for encoding" message
+   and skips the scan (the files aren't on the server yet) (`modules/notifier.py`)
 8. **Eject** and wait for the next disc
 
 ### Why Claude is in the loop
@@ -99,6 +105,10 @@ MEDIA_ROOT=/home/yourusername/jellyfin/media
 # season whether or not it's been ripped yet)
 TMDB_API_KEY=
 
+# Optional — Blu-ray staging root on THIS machine. Blu-rays (BDMV) are staged
+# here for encoding instead of going straight to the server; DVDs ignore it.
+BLURAY_STAGING_DIR=~/video-transfer
+
 # Optional — Discord approval gate (--approve). Needs a bot, not just the webhook
 DISCORD_BOT_TOKEN=
 DISCORD_CHANNEL_ID=
@@ -112,14 +122,16 @@ REVIEW_UI_THUMBS_PER_TITLE=12
 REVIEW_UI_ADVERTISE_HOST=   # blank ⇒ Tailscale IP if available, else LAN hostname
 ```
 
-Files land under `MEDIA_ROOT`:
+DVD files land under `MEDIA_ROOT` on the server:
 
 ```
 $MEDIA_ROOT/movies/
 $MEDIA_ROOT/tvshows/
 ```
 
-Make sure those directories exist on the server.
+Make sure those directories exist on the server. Blu-ray rips instead land
+locally under `BLURAY_STAGING_DIR` (same `movies/` and `tvshows/` layout), where
+you encode them before copying to the server yourself.
 
 > **Security note:** the review UI binds `0.0.0.0` and trusts the tailnet as its
 > boundary. Never port-forward it, reverse-proxy it, or expose it via Tailscale
@@ -209,14 +221,14 @@ pytest
 ripper.py                 # Entry point / main loop, CLI flags, gate orchestration
 config.py                 # Loads .env into a Config dataclass
 modules/
-  disc_watcher.py         # Polls for disc insertion (macOS + Linux)
+  disc_watcher.py         # Polls for disc insertion + DVD/Blu-ray detection (macOS + Linux)
   ripper.py               # Wraps makemkvcon to rip titles
   episode_guide.py        # Fetches the real season episode list (TMDB / Jellyfin)
   namer.py                # Legacy naming: Claude assigns numbers from label + durations
   identify.py             # Content-ID: subtitle OCR / frame vision → episode match
   approval.py             # --approve: Discord bot approval gate
   review_ui.py            # --review-ui: local filmstrip curation page
-  transfer.py             # SCPs files to the home server with retry
+  transfer.py             # DVD → SCP to server; Blu-ray → stage locally for encoding
   notifier.py             # Triggers Jellyfin scan + Discord webhook
 docs/                     # Design notes: episode-identification-plan.md, review-ui-plan.md, ...
 ```

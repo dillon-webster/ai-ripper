@@ -106,7 +106,13 @@ def main(season: int = None, disc: int = None, show: str = None,
 
     while True:
         volume_name, volume_path = disc_watcher.wait_for_disc()
-        log.info(f"Disc detected: {volume_name} at {volume_path}")
+        # Blu-ray vs DVD decides the destination: a Blu-ray's raw rip is 20-40GB+,
+        # so it's staged locally for encoding before it ever reaches the server,
+        # while a DVD transfers straight there. Detected from the disc structure
+        # (BDMV vs VIDEO_TS) — no flag to remember/forget. See the transfer step below.
+        kind = disc_watcher.disc_type(volume_path)
+        is_bluray = kind == "bluray"
+        log.info(f"Disc detected: {volume_name} at {volume_path} (type: {kind})")
 
         # `held` (approval declined/timed out) keeps temp files + disc for manual
         # handling, mirroring --dry-run. Reset per disc, read in the finally block.
@@ -246,13 +252,18 @@ def main(season: int = None, disc: int = None, show: str = None,
                     continue
                 log.info(f"Approved — {decision.reason}. Transferring.")
 
-            transfer.send_all(named, config)
-            log.info("Transfer complete")
-
-            notifier.trigger_jellyfin_scan(config)
-            notifier.send_discord(
-                [t["jellyfin_filename"] for t in named], success=True, config=config
-            )
+            filenames = [t["jellyfin_filename"] for t in named]
+            if is_bluray:
+                # Blu-ray: stage locally for manual encoding — do NOT push to the
+                # server or trigger a Jellyfin scan (the files aren't there yet).
+                staged = transfer.stage_local(named, config)
+                log.info(f"Staged {len(staged)} Blu-ray title(s) for encoding")
+                notifier.send_discord(filenames, success=True, config=config, staged=True)
+            else:
+                transfer.send_all(named, config)
+                log.info("Transfer complete")
+                notifier.trigger_jellyfin_scan(config)
+                notifier.send_discord(filenames, success=True, config=config)
 
         except RipError as e:
             log.error(f"Rip failed: {e}")

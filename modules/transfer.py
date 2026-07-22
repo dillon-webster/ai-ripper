@@ -1,6 +1,7 @@
 import logging
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -117,3 +118,36 @@ def send_all(named_titles: List[Dict], config) -> List[str]:
             )
 
     return remote_paths
+
+
+def stage_local(named_titles: List[Dict], config) -> List[Path]:
+    """
+    Move each ripped title into the local Blu-ray staging tree instead of sending
+    it to the server. Blu-ray rips are 20-40GB+ raw, so they're staged here (under
+    the SAME movies/tvshows layout send_all uses on the server) to be encoded down
+    before a later manual copy to the server. Returns the list of staged local paths.
+
+    Uses shutil.move: an instant rename when TEMP_DIR and the staging dir share a
+    filesystem, else a copy+delete (correct, just slower). A title already present
+    at its destination is skipped (its temp file is left for the normal cleanup).
+    Raises TransferError if a move fails, so the disc is held rather than lost.
+    """
+    staging_root = Path(config.bluray_staging_dir).expanduser()
+    staged: List[Path] = []
+
+    for title in named_titles:
+        filename = title["jellyfin_filename"]
+        dest = staging_root / _remote_subpath(title)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        if dest.exists():
+            log.info(f"Skipping {filename} — already staged at {dest}")
+            continue
+        try:
+            shutil.move(str(title["path"]), str(dest))
+        except OSError as e:
+            raise TransferError(f"Failed to stage {filename} to {dest}: {e}") from e
+        staged.append(dest)
+        log.info(f"Staged for encoding: {filename} → {dest}")
+
+    return staged

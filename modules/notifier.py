@@ -80,11 +80,20 @@ def send_review_ready(url: str, show: str, season: int, config) -> None:
     log.info("Discord review-ready notification sent")
 
 
-def send_discord(titles: List[str], success: bool, config, error: str = "") -> None:
-    """Send Discord webhook notification. Retries 3×. Never raises."""
+def send_discord(titles: List[str], success: bool, config, error: str = "",
+                 staged: bool = False) -> None:
+    """Send Discord webhook notification. Retries 3×. Never raises.
+
+    staged=True is the Blu-ray path: the titles were moved to the local staging
+    dir for encoding, NOT put on the server, so the message says so instead of
+    claiming they're in Jellyfin."""
     if success:
         title_lines = "\n".join(f"• {t}" for t in titles)
-        content = f"✅ Rip complete! Added to Jellyfin:\n{title_lines}\n\nInsert next disc."
+        if staged:
+            content = (f"📦 Blu-ray ripped and staged for encoding:\n{title_lines}\n\n"
+                       "Encode, then copy to the server. Insert next disc.")
+        else:
+            content = f"✅ Rip complete! Added to Jellyfin:\n{title_lines}\n\nInsert next disc."
     else:
         content = f"❌ Ripper failed: {error}"
 

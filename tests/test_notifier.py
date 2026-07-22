@@ -75,6 +75,19 @@ def test_send_discord_success_message_contains_titles():
     assert "Friends.S01E02.mkv" in body["content"]
 
 
+def test_send_discord_staged_message_says_encode_not_jellyfin():
+    config = _make_config()
+    with patch("modules.notifier.urllib.request.urlopen") as mock_urlopen:
+        send_discord(["Inception.2010.mkv"], success=True, config=config, staged=True)
+
+    req = mock_urlopen.call_args[0][0]
+    import json
+    body = json.loads(req.data.decode())
+    assert "Inception.2010.mkv" in body["content"]
+    assert "encoding" in body["content"].lower()
+    assert "Added to Jellyfin" not in body["content"]  # not on the server yet
+
+
 def test_send_discord_failure_message_contains_error():
     config = _make_config()
     with patch("modules.notifier.urllib.request.urlopen") as mock_urlopen:

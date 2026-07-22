@@ -1,11 +1,33 @@
 from pathlib import Path
 from unittest.mock import patch
-from modules.disc_watcher import _is_optical_disc, wait_for_disc
+from modules.disc_watcher import _is_optical_disc, disc_type, wait_for_disc
 
 
 def test_is_optical_disc_dvd(tmp_path):
     (tmp_path / "VIDEO_TS").mkdir()
     assert _is_optical_disc(tmp_path) is True
+
+
+def test_disc_type_bluray(tmp_path):
+    (tmp_path / "BDMV").mkdir()
+    assert disc_type(tmp_path) == "bluray"
+
+
+def test_disc_type_dvd(tmp_path):
+    (tmp_path / "VIDEO_TS").mkdir()
+    assert disc_type(tmp_path) == "dvd"
+
+
+def test_disc_type_unknown(tmp_path):
+    (tmp_path / "Documents").mkdir()
+    assert disc_type(tmp_path) == "unknown"
+
+
+def test_disc_type_prefers_bluray_on_hybrid(tmp_path):
+    # A disc carrying both structures is treated as Blu-ray (BDMV checked first).
+    (tmp_path / "BDMV").mkdir()
+    (tmp_path / "VIDEO_TS").mkdir()
+    assert disc_type(tmp_path) == "bluray"
 
 
 def test_is_optical_disc_bluray(tmp_path):

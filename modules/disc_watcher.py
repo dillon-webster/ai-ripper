@@ -33,6 +33,19 @@ def _is_optical_disc(volume_path: Path) -> bool:
     return (volume_path / "VIDEO_TS").exists() or (volume_path / "BDMV").exists()
 
 
+def disc_type(volume_path: Path) -> str:
+    """Classify an optical disc by its on-disc structure: 'bluray' (BDMV/),
+    'dvd' (VIDEO_TS/), or 'unknown'. The distinction drives routing: Blu-rays
+    are staged locally for manual encoding (their raw rips are 20-40GB+), while
+    DVDs transfer straight to the server. Checked BDMV-first so a hybrid disc
+    carrying both structures is treated as Blu-ray."""
+    if (volume_path / "BDMV").exists():
+        return "bluray"
+    if (volume_path / "VIDEO_TS").exists():
+        return "dvd"
+    return "unknown"
+
+
 def wait_for_disc() -> Tuple[str, Path]:
     """Block until an optical disc is inserted. Returns (volume_name, volume_path)."""
     # Track optical discs we've already handled by path. We deliberately do NOT
