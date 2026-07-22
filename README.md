@@ -20,9 +20,10 @@ The daemon loops forever, one disc at a time (`ripper.py`):
 6. **Transfer** — routed by disc type (`modules/transfer.py`):
    - **DVD** → SCPs the named files straight to the server.
    - **Blu-ray** → *staged locally* to `BLURAY_STAGING_DIR` (default `~/video-transfer`)
-     under the same `movies/` and `tvshows/` layout, so you can encode/compress the
-     20-40GB+ raw rips before copying them to the server. Detected automatically from
-     the disc structure (`BDMV` vs `VIDEO_TS`) — no flag to pass.
+     so you can encode/compress the 20-40GB+ raw rips before copying to the server.
+     Movies use the folder-per-movie layout the HEVC encode script expects
+     (`movies/<Title (Year)>/<Title (Year)>.mkv`); TV uses `tvshows/Show/Season NN/…`.
+     Detected automatically from the disc structure (`BDMV` vs `VIDEO_TS`) — no flag.
 7. **Notify** — for a DVD, triggers a Jellyfin library scan and sends a Discord
    message; for a staged Blu-ray, sends a "ripped and staged for encoding" message
    and skips the scan (the files aren't on the server yet) (`modules/notifier.py`)

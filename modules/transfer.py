@@ -35,6 +35,32 @@ def _remote_subpath(title: Dict) -> str:
     return f"{dest}/{filename}"
 
 
+def _movie_folder_name(filename: str) -> str:
+    """Convert a namer movie filename ('The.Conjuring.2013.mkv') into the
+    folder-per-movie name Jellyfin and the HEVC encode script expect:
+    'The Conjuring (2013)' — dots→spaces, trailing year wrapped in parens. The
+    year is taken as the last 4-digit 19xx/20xx token so titles that themselves
+    contain a number ('Blade.Runner.2049.2017') resolve correctly. With no year
+    found, just de-dot the base name."""
+    base = filename[:-4] if filename.lower().endswith(".mkv") else filename
+    m = re.match(r"^(.*)[.\s]((?:19|20)\d{2})$", base)
+    if m:
+        title = m.group(1).replace(".", " ").strip()
+        return f"{title} ({m.group(2)})"
+    return base.replace(".", " ").strip()
+
+
+def _staging_subpath(title: Dict) -> str:
+    """Relative path within the local Blu-ray staging root. Movies use the
+    folder-per-movie layout the encode pipeline consumes
+    ('movies/<Title (Year)>/<Title (Year)>.mkv'); TV reuses the flat server
+    layout ('tvshows/Show/Season NN/Show.SxxExx.mkv')."""
+    if title.get("media_type") == "movie":
+        folder = _movie_folder_name(title["jellyfin_filename"])
+        return f"{title['destination']}/{folder}/{folder}.mkv"
+    return _remote_subpath(title)
+
+
 def _ssh_mkdir(remote_dir: str, config) -> None:
     result = subprocess.run(
         ["ssh", *SSH_OPTS, f"{config.server_user}@{config.server_ip}",
@@ -123,9 +149,11 @@ def send_all(named_titles: List[Dict], config) -> List[str]:
 def stage_local(named_titles: List[Dict], config) -> List[Path]:
     """
     Move each ripped title into the local Blu-ray staging tree instead of sending
-    it to the server. Blu-ray rips are 20-40GB+ raw, so they're staged here (under
-    the SAME movies/tvshows layout send_all uses on the server) to be encoded down
-    before a later manual copy to the server. Returns the list of staged local paths.
+    it to the server. Blu-ray rips are 20-40GB+ raw, so they're staged here to be
+    encoded down before a later manual copy to the server. Layout (see
+    _staging_subpath): movies use the folder-per-movie form the HEVC encode script
+    reads ('movies/<Title (Year)>/<Title (Year)>.mkv'); TV uses 'tvshows/Show/
+    Season NN/...'. Returns the list of staged local paths.
 
     Uses shutil.move: an instant rename when TEMP_DIR and the staging dir share a
     filesystem, else a copy+delete (correct, just slower). A title already present
@@ -137,7 +165,7 @@ def stage_local(named_titles: List[Dict], config) -> List[Path]:
 
     for title in named_titles:
         filename = title["jellyfin_filename"]
-        dest = staging_root / _remote_subpath(title)
+        dest = staging_root / _staging_subpath(title)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         if dest.exists():

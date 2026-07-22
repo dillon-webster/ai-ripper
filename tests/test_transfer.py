@@ -5,6 +5,7 @@ from unittest.mock import patch, MagicMock, call
 from config import Config
 from modules.transfer import (
     send_all, stage_local, TransferError, _remote_subpath, _remote_file_exists,
+    _movie_folder_name, _staging_subpath,
 )
 
 
@@ -125,7 +126,31 @@ def _make_movie_titled(tmp_path):
     }]
 
 
-def test_stage_local_moves_movie_to_staging_movies_dir(tmp_path):
+def test_movie_folder_name_wraps_year_in_parens():
+    assert _movie_folder_name("The.Conjuring.2013.mkv") == "The Conjuring (2013)"
+
+
+def test_movie_folder_name_uses_last_year_when_title_has_a_number():
+    assert _movie_folder_name("Blade.Runner.2049.2017.mkv") == "Blade Runner 2049 (2017)"
+
+
+def test_movie_folder_name_without_year_just_despaces():
+    assert _movie_folder_name("Some.Untitled.Feature.mkv") == "Some Untitled Feature"
+
+
+def test_staging_subpath_movie_is_folder_per_movie():
+    title = {"jellyfin_filename": "Inception.2010.mkv", "media_type": "movie",
+             "destination": "movies"}
+    assert _staging_subpath(title) == "movies/Inception (2010)/Inception (2010).mkv"
+
+
+def test_staging_subpath_tv_matches_server_layout():
+    title = {"jellyfin_filename": "Friends.S01E01.mkv", "media_type": "tv",
+             "destination": "tvshows"}
+    assert _staging_subpath(title) == "tvshows/Friends/Season 01/Friends.S01E01.mkv"
+
+
+def test_stage_local_moves_movie_to_folder_per_movie_layout(tmp_path):
     staging = tmp_path / "staging"
     titles = _make_movie_titled(tmp_path)
     src = titles[0]["path"]
@@ -133,7 +158,9 @@ def test_stage_local_moves_movie_to_staging_movies_dir(tmp_path):
 
     result = stage_local(titles, config)
 
-    dest = staging / "movies" / "Inception.2010.mkv"
+    # Folder-per-movie layout the HEVC encode script reads (matches the real
+    # ~/video-transfer/movies/The Conjuring (2013)/The Conjuring (2013).mkv).
+    dest = staging / "movies" / "Inception (2010)" / "Inception (2010).mkv"
     assert result == [dest]
     assert dest.exists()
     assert not src.exists()  # moved, not copied
@@ -162,14 +189,14 @@ def test_stage_local_expands_user_home(tmp_path):
 
     dest_arg = Path(mock_move.call_args[0][1])
     assert "~" not in str(dest_arg)
-    assert str(dest_arg).endswith("video-transfer/movies/Inception.2010.mkv")
+    assert str(dest_arg).endswith("video-transfer/movies/Inception (2010)/Inception (2010).mkv")
 
 
 def test_stage_local_skips_when_already_staged(tmp_path):
     staging = tmp_path / "staging"
     titles = _make_movie_titled(tmp_path)
     src = titles[0]["path"]
-    dest = staging / "movies" / "Inception.2010.mkv"
+    dest = staging / "movies" / "Inception (2010)" / "Inception (2010).mkv"
     dest.parent.mkdir(parents=True)
     dest.write_bytes(b"existing")
     config = replace(_make_config(), bluray_staging_dir=str(staging))
