@@ -166,7 +166,10 @@ def rip(volume_path: Path, temp_dir: Path, max_title_secs: int = None) -> List[D
     for idx in eligible_indices:
         log.info(f"Ripping title #{idx}...")
         rip_result = subprocess.run(
-            ["makemkvcon", "mkv", "disc:0", str(idx), str(temp_dir)],
+            # --progress=-same sends the percentage to our stdout. Without it
+            # makemkvcon sees a non-TTY and prints no progress at all, so the log
+            # has nothing for the dashboard to show a rip bar from.
+            ["makemkvcon", "--progress=-same", "mkv", "disc:0", str(idx), str(temp_dir)],
             check=False,
         )
         if rip_result.returncode != 0:

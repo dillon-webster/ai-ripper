@@ -45,9 +45,23 @@ def test_remote_subpath_tv_multiword_show():
     assert _remote_subpath(title) == "tvshows/The Office/Season 03/The.Office.S03E07.mkv"
 
 
-def test_remote_subpath_movie():
+def test_remote_subpath_movie_uses_folder_per_movie():
     title = {"jellyfin_filename": "Inception.2010.mkv", "media_type": "movie", "destination": "movies"}
-    assert _remote_subpath(title) == "movies/Inception.2010.mkv"
+    assert _remote_subpath(title) == "movies/Inception (2010)/Inception (2010).mkv"
+
+
+def test_remote_subpath_movie_matches_staging_layout():
+    """The DVD path (_remote_subpath) and the Blu-ray path (_staging_subpath)
+    must put a movie in the same shape — a DVD rip that lands flat is invisible
+    to the encode script and the dashboard's movie transfers."""
+    title = {"jellyfin_filename": "Inception.2010.mkv", "media_type": "movie", "destination": "movies"}
+    assert _remote_subpath(title) == _staging_subpath(title)
+
+
+def test_remote_subpath_movie_without_year():
+    """No parsable year → de-dotted base name, no parens (e.g. 'Obsession')."""
+    title = {"jellyfin_filename": "Obsession.mkv", "media_type": "movie", "destination": "movies"}
+    assert _remote_subpath(title) == "movies/Obsession/Obsession.mkv"
 
 
 def test_send_all_transfers_to_correct_path(tmp_path):

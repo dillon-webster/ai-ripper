@@ -130,7 +130,7 @@ def test_rip_prunes_full_length_bonus_by_source_set(tmp_path):
         if "info" in cmd:
             mock.stdout = info_output
         elif "mkv" in cmd:
-            ripped.append(cmd[3])  # title-index argument to `makemkvcon mkv`
+            ripped.append(cmd[cmd.index("mkv") + 2])  # title-index arg, whatever flags precede it
         return mock
 
     with patch("modules.ripper.subprocess.run", side_effect=fake_run):
@@ -162,7 +162,7 @@ def test_rip_skips_titles_over_max_title_secs(tmp_path):
         if "info" in cmd:
             mock.stdout = info_output
         elif "mkv" in cmd:
-            ripped.append(cmd[3])  # title-index argument to `makemkvcon mkv`
+            ripped.append(cmd[cmd.index("mkv") + 2])  # title-index arg, whatever flags precede it
         return mock
 
     with patch("modules.ripper.subprocess.run", side_effect=fake_run):

@@ -22,7 +22,13 @@ def _remote_subpath(title: Dict) -> str:
     """
     Return the relative path within the media root.
     TV:    'tvshows/Friends/Season 01/Friends.S01E01.mkv'
-    Movie: 'movies/Inception.2010.mkv'
+    Movie: 'movies/Inception (2010)/Inception (2010).mkv'
+
+    Movies use the same folder-per-movie layout as _staging_subpath. Keeping the
+    two in step matters: this is the DVD path and that one is the Blu-ray path,
+    so a flat movie file here meant DVD rips landed in a shape the encode script
+    and the dashboard's transfer helpers (both of which address a movie by its
+    folder) couldn't see.
     """
     filename = title["jellyfin_filename"]
     dest = title["destination"]
@@ -32,7 +38,8 @@ def _remote_subpath(title: Dict) -> str:
             show = m.group(1).replace(".", " ")
             season = m.group(2)
             return f"{dest}/{show}/Season {season}/{filename}"
-    return f"{dest}/{filename}"
+    folder = _movie_folder_name(filename)
+    return f"{dest}/{folder}/{folder}.mkv"
 
 
 def _movie_folder_name(filename: str) -> str:
