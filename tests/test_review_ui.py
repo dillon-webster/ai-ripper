@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from config import Config
-from modules import review_ui
+from modules import identify, review_ui
 from modules.review_ui import ReviewDecision
 
 
@@ -428,3 +428,80 @@ def test_thumb_endpoint_rejects_unknown_title_and_stale_nonce(tmp_path):
         pass
     t.join(timeout=5)
     assert result["decision"].approved is True
+
+
+# --- volume discs: two seasons of slots on one page --------------------------
+
+def _volume_guide():
+    """A disc from a volume box set: the tail of S04 and the head of S05. Note E01
+    exists in BOTH seasons — the collision the episode key exists to break."""
+    return [
+        {"season": 4, "index": 30, "index_end": None, "name": "Brian Sings", "runtime_secs": 1320},
+        {"season": 5, "index": 1, "index_end": None, "name": "Stewie Loves Lois", "runtime_secs": 1330},
+        {"season": 5, "index": 2, "index_end": None, "name": "Mother Tucker", "runtime_secs": 1320},
+    ]
+
+
+def test_page_model_offers_slots_from_every_season_on_the_disc():
+    model = review_ui.build_page_model(_all_titles(), [], [], _volume_guide(),
+                                       "Family Guy", [4, 5])
+    assert model["multi_season"] is True
+    assert model["season_heading"] == "Seasons 4 + 5"
+    assert [(e["season"], e["index"]) for e in model["episodes"]] == [(4, 30), (5, 1), (5, 2)]
+    # Every slot is addressed by a distinct key, so S04E30 and S05E01 can't collide.
+    assert len({e["key"] for e in model["episodes"]}) == 3
+
+
+def test_page_model_preselects_the_slot_in_the_season_the_title_matched():
+    named = [{"path": Path("/tmp/title_t00.mkv"), "title_index": 0, "duration_secs": 1330,
+              "season": 5, "episode": 1, "jellyfin_filename": "Family.Guy.S05E01.mkv",
+              "method": "subtitles", "confidence": 0.95}]
+    model = review_ui.build_page_model(_all_titles(), named, [], _volume_guide(),
+                                       "Family Guy", [4, 5])
+    guess = model["titles"][0]["guess"]
+    assert guess == identify.episode_key(5, 1)
+    assert guess != identify.episode_key(4, 1)  # not the other season's E01
+
+
+def test_page_model_single_season_heading_is_unchanged():
+    model = review_ui.build_page_model(_all_titles(), _named(), _dropped(),
+                                       _guide(), "The Office", 2)
+    assert model["multi_season"] is False
+    assert model["season_heading"] == "Season 2"
+
+
+def test_curated_named_files_each_assignment_under_its_own_season():
+    """A volume disc reviewed by hand: title 0 → S04E30, title 1 → S05E01."""
+    guide = _volume_guide()
+    named = review_ui.build_curated_named(
+        {"0": identify.episode_key(4, 30), "1": identify.episode_key(5, 1)},
+        _all_titles(), guide, "Family Guy", [4, 5])
+    assert [t["jellyfin_filename"] for t in named] == \
+        ["Family.Guy.S04E30.mkv", "Family.Guy.S05E01.mkv"]
+    assert [t["episode_name"] for t in named] == ["Brian Sings", "Stewie Loves Lois"]
+
+
+def test_curated_named_allows_the_same_episode_number_in_each_season():
+    """S04E01 and S05E01 are different slots — assigning both is not a duplicate."""
+    guide = [{"season": 4, "index": 1, "index_end": None, "name": "a", "runtime_secs": 1320},
+             {"season": 5, "index": 1, "index_end": None, "name": "b", "runtime_secs": 1320}]
+    named = review_ui.build_curated_named(
+        {"0": identify.episode_key(4, 1), "1": identify.episode_key(5, 1)},
+        _all_titles(), guide, "Family Guy", [4, 5])
+    assert [t["jellyfin_filename"] for t in named] == \
+        ["Family.Guy.S04E01.mkv", "Family.Guy.S05E01.mkv"]
+
+
+def test_curated_named_still_rejects_the_same_slot_twice_on_a_volume_disc():
+    with pytest.raises(ValueError, match="assigned to two titles"):
+        review_ui.build_curated_named(
+            {"0": identify.episode_key(5, 1), "1": identify.episode_key(5, 1)},
+            _all_titles(), _volume_guide(), "Family Guy", [4, 5])
+
+
+def test_rendered_page_labels_volume_slots_with_their_season():
+    model = review_ui.build_page_model(_all_titles(), [], [], _volume_guide(),
+                                       "Family Guy", [4, 5])
+    html = review_ui.render_page(model)
+    assert "volume disc" in html          # the page says why there are two seasons
+    assert str(identify.episode_key(5, 1)) in html   # slots addressed by key

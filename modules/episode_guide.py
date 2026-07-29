@@ -64,7 +64,12 @@ def find_series_id(show_name: str, config) -> Optional[str]:
 
 def get_season_episodes(show_name: str, season: int, config) -> List[Dict]:
     """Return the real episode list for `show_name` season `season`:
-    [{"index", "index_end", "name", "runtime_secs", "overview"}], sorted by episode number.
+    [{"season", "index", "index_end", "name", "runtime_secs", "overview"}], sorted by
+    episode number.
+
+    Every entry carries its `season` so lists for two seasons can be concatenated into
+    one candidate pool (a volume disc that straddles a boundary) without E10 from one
+    season being mistaken for E10 of the other. See identify.episode_key.
 
     Prefers **TMDB** when `config.tmdb_api_key` is set — TMDB has every season whether
     or not it's in your library, so content-ID works when ripping a NEW season (Jellyfin
@@ -77,6 +82,10 @@ def get_season_episodes(show_name: str, season: int, config) -> List[Dict]:
 
     Raises EpisodeGuideError only if BOTH sources fail (or Jellyfin fails with no TMDB key).
     """
+    return [{**e, "season": season} for e in _fetch_season(show_name, season, config)]
+
+
+def _fetch_season(show_name: str, season: int, config) -> List[Dict]:
     if getattr(config, "tmdb_api_key", ""):
         try:
             episodes = _tmdb_season_episodes(show_name, season, config)

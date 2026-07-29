@@ -82,22 +82,58 @@ def thumb_timestamps(duration_secs: Optional[int], count: int) -> List[int]:
     return out
 
 
-def _episode_of(named_title: Dict) -> Optional[int]:
-    """The (start) episode number of a named title — from the `episode` key when the
-    content-ID pipeline produced it, else parsed from the Jellyfin filename (the
-    legacy namer sets only the filename)."""
-    if named_title.get("episode") is not None:
-        return named_title["episode"]
-    m = _EP_TAG_RE.search(named_title.get("jellyfin_filename", ""))
-    return int(m.group(2)) if m else None
+def _season_list(seasons) -> List[int]:
+    """Normalize the season argument (int, list, or None) to a sorted list. A volume
+    disc is reviewed against two seasons at once."""
+    if seasons is None:
+        return []
+    if isinstance(seasons, int):
+        return [seasons]
+    return sorted({int(s) for s in seasons})
+
+
+def _season_heading(seasons) -> str:
+    ss = _season_list(seasons)
+    if not ss:
+        return ""
+    if len(ss) == 1:
+        return f"Season {ss[0]}"
+    return "Seasons " + " + ".join(str(s) for s in ss)
+
+
+def _slot_label(entry: Dict) -> str:
+    """How one guide slot reads in an error message: E05, or S04E05 on a volume disc."""
+    season = entry.get("season")
+    return (f"S{season:02d}" if season is not None else "") + f"E{entry['index']:02d}"
+
+
+def _guess_key(named_title: Dict, guide: List[Dict]) -> Optional[int]:
+    """Which guide slot a named title is proposing, as an identify.episode_key.
+
+    Read from the title's own season/episode when the content-ID pipeline produced it,
+    else parsed out of the Jellyfin filename (the legacy namer sets only the filename).
+    Resolved against the guide so the answer is always a slot the page actually offers."""
+    season, episode = named_title.get("season"), named_title.get("episode")
+    if episode is None:
+        m = _EP_TAG_RE.search(named_title.get("jellyfin_filename", ""))
+        if not m:
+            return None
+        season, episode = int(m.group(1)), int(m.group(2))
+    for e in guide:
+        if e["index"] == episode and (season is None or e.get("season") in (None, season)):
+            return identify.episode_key(e.get("season"), e["index"])
+    return None
 
 
 def build_page_model(all_titles: List[Dict], named: List[Dict], dropped: List[Dict],
-                     guide: List[Dict], show: str, season: int,
+                     guide: List[Dict], show: str, seasons,
                      thumbs_per_title: int = DEFAULT_THUMBS_PER_TITLE,
                      nonce: Optional[str] = None) -> Dict:
     """JSON-able model the page renders from: every ripped title (kept AND dropped)
-    with its pipeline guess, plus the season's episode slots.
+    with its pipeline guess, plus the episode slots of every season on this disc.
+
+    Slots are addressed by `identify.episode_key`, not by bare episode number, so a
+    volume disc spanning S04→S05 offers both E10s as distinct choices.
 
     `nonce` (fresh per call unless given) goes into every thumb URL so no two review
     sessions ever share one — title indices and grab timestamps repeat across discs
@@ -105,7 +141,7 @@ def build_page_model(all_titles: List[Dict], named: List[Dict], dropped: List[Di
     would happily show a previous disc's cached frame for the same URL."""
     named_by_idx = {t.get("title_index"): t for t in (named or [])}
     dropped_by_idx = {t.get("title_index"): t for t in (dropped or [])}
-    guide_episodes = {e["index"] for e in guide}
+    season_list = _season_list(seasons)
 
     titles = []
     for t in sorted(all_titles, key=lambda x: x.get("title_index") or 0):
@@ -115,9 +151,7 @@ def build_page_model(all_titles: List[Dict], named: List[Dict], dropped: List[Di
         guess, label, status = None, "no proposal", "unassigned"
         if nt is not None:
             status = "kept"
-            guess = _episode_of(nt)
-            if guess not in guide_episodes:
-                guess = None  # can't preselect an episode the guide doesn't list
+            guess = _guess_key(nt, guide)  # None when the guide doesn't list it
             label = f"→ {nt.get('jellyfin_filename', '?')}"
             if nt.get("episode_name"):
                 label += f" — {nt['episode_name']}"
@@ -138,52 +172,62 @@ def build_page_model(all_titles: List[Dict], named: List[Dict], dropped: List[Di
 
     return {
         "show": show,
-        "season": season,
+        "seasons": season_list,
+        "season_heading": _season_heading(season_list),
+        "multi_season": len(season_list) > 1,
         "nonce": nonce or secrets.token_hex(8),
-        "episodes": [{"index": e["index"], "index_end": e.get("index_end"),
-                      "name": e.get("name")} for e in guide],
+        "episodes": [{"key": identify.episode_key(e.get("season"), e["index"]),
+                      "season": e.get("season"), "index": e["index"],
+                      "index_end": e.get("index_end"), "name": e.get("name")}
+                     for e in guide],
         "titles": titles,
     }
 
 
 def build_curated_named(assignments: Dict, all_titles: List[Dict], guide: List[Dict],
-                        show: str, season: int) -> List[Dict]:
-    """Turn the submitted `{title_index: episode|null}` map into a transfer-ready
+                        show: str, seasons) -> List[Dict]:
+    """Turn the submitted `{title_index: episode_key|null}` map into a transfer-ready
     `named` list (the shape transfer.send_all consumes). null/absent = excluded.
-    Raises ValueError on bad input — unknown title/episode, or the same episode
-    assigned to two titles (which would clobber one file with the other on transfer);
-    the HTTP handler turns that into a 400 so the page can show it."""
+    Keys are `identify.episode_key` values, so an assignment names one slot of one
+    season even when the disc spans two. Raises ValueError on bad input — unknown
+    title/slot, or the same slot assigned to two titles (which would clobber one file
+    with the other on transfer); the HTTP handler turns that into a 400 so the page
+    can show it."""
     if not isinstance(assignments, dict):
         raise ValueError("assignments must be an object of {title_index: episode|null}")
     by_index = {t["title_index"]: t for t in all_titles}
-    by_episode = {e["index"]: e for e in guide}
+    by_key = {identify.episode_key(e.get("season"), e["index"]): e for e in guide}
+    fallback_season = (_season_list(seasons) or [None])[0]
 
     named, claimed = [], {}
-    for tidx_raw, episode in assignments.items():
-        if episode is None:
+    for tidx_raw, key in assignments.items():
+        if key is None:
             continue  # excluded / not an episode
         try:
-            tidx, episode = int(tidx_raw), int(episode)
+            tidx, key = int(tidx_raw), int(key)
         except (TypeError, ValueError):
-            raise ValueError(f"bad assignment: {tidx_raw!r} → {episode!r}")
+            raise ValueError(f"bad assignment: {tidx_raw!r} → {key!r}")
         src = by_index.get(tidx)
         if src is None:
             raise ValueError(f"unknown title index {tidx}")
-        entry = by_episode.get(episode)
+        entry = by_key.get(key)
         if entry is None:
-            raise ValueError(f"episode {episode} is not in the season guide")
-        if episode in claimed:
-            raise ValueError(f"episode {episode} is assigned to two titles "
-                             f"(#{claimed[episode]} and #{tidx})")
-        claimed[episode] = tidx
-        # Carry the guide entry's index_end so a double-episode slot names as E01-E02.
+            raise ValueError(f"episode {identify.split_key(key)[1]} is not in the season guide")
+        label = _slot_label(entry)
+        if key in claimed:
+            raise ValueError(f"episode {label} is assigned to two titles "
+                             f"(#{claimed[key]} and #{tidx})")
+        claimed[key] = tidx
+        # Carry the guide entry's index_end so a double-episode slot names as E01-E02,
+        # and its season so a volume disc files each episode under the right one.
         nt = identify.build_named_title(
-            {**src, "episode": episode, "index_end": entry.get("index_end")}, show, season)
+            {**src, "season": entry.get("season"), "episode": entry["index"],
+             "index_end": entry.get("index_end")}, show, fallback_season)
         nt["episode_name"] = entry.get("name")
         nt["method"] = "review-ui"
         nt["confidence"] = 1.0
         named.append(nt)
-    named.sort(key=lambda t: t["episode"])
+    named.sort(key=lambda t: identify.episode_key(t.get("season"), t["episode"]))
     return named
 
 
@@ -269,12 +313,12 @@ def _advertised_host(config) -> str:
 class _ReviewState:
     """Shared between request_review and the handler threads."""
 
-    def __init__(self, all_titles, guide, show, season, page, thumbs, nonce):
+    def __init__(self, all_titles, guide, show, seasons, page, thumbs, nonce):
         self.all_titles = all_titles
         self.by_index = {t["title_index"]: t for t in all_titles}
         self.guide = guide
         self.show = show
-        self.season = season
+        self.seasons = seasons
         self.page = page
         self.thumbs = thumbs
         self.nonce = nonce
@@ -346,7 +390,7 @@ def _make_handler(state: _ReviewState):
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 named = build_curated_named(payload["assignments"], state.all_titles,
-                                            state.guide, state.show, state.season)
+                                            state.guide, state.show, state.seasons)
             except (ValueError, KeyError, TypeError) as e:
                 return self._send(400, "application/json",
                                   json.dumps({"error": str(e)}).encode())
@@ -362,7 +406,7 @@ def _make_handler(state: _ReviewState):
 
 
 def request_review(all_titles: List[Dict], named: List[Dict], dropped: List[Dict],
-                   guide: List[Dict], show: str, season: int, config,
+                   guide: List[Dict], show: str, seasons, config,
                    timeout: int = None, _on_start=None) -> ReviewDecision:
     """Launch the local review server, log the URL, and block until the user submits
     a curated mapping (approved, with `titles`) or timeout/failure (approved=False —
@@ -371,7 +415,8 @@ def request_review(all_titles: List[Dict], named: List[Dict], dropped: List[Dict
     `_on_start(host, port)` is a test hook fired once the server is listening.
     """
     timeout = timeout or getattr(config, "review_ui_timeout_secs", DEFAULT_TIMEOUT_SECS)
-    if not guide or not show or season is None:
+    season_list = _season_list(seasons)
+    if not guide or not show or not season_list:
         log.warning("Review UI needs the episode guide (--show + --season) — holding.")
         return ReviewDecision(False, "review UI needs an episode guide (--show + --season)")
 
@@ -388,9 +433,9 @@ def request_review(all_titles: List[Dict], named: List[Dict], dropped: List[Dict
         shutil.rmtree(thumb_dir, ignore_errors=True)
         thumb_dir.mkdir(parents=True, exist_ok=True)
 
-        model = build_page_model(all_titles, named, dropped, guide, show, season,
+        model = build_page_model(all_titles, named, dropped, guide, show, season_list,
                                  thumbs_per_title)
-        state = _ReviewState(all_titles, guide, show, season,
+        state = _ReviewState(all_titles, guide, show, season_list,
                              page=render_page(model), thumbs=_ThumbCache(thumb_dir),
                              nonce=model["nonce"])
 
@@ -406,7 +451,7 @@ def request_review(all_titles: List[Dict], named: List[Dict], dropped: List[Dict
         # Ping Discord with the link — the user usually isn't at a desk when the
         # rip finishes. (Phone push requires desktop Discord to be fully quit;
         # see notifier.send_review_ready.)
-        notifier.send_review_ready(url, show, season, config)
+        notifier.send_review_ready(url, show, season_list, config)
         if _on_start:
             _on_start(host, bound_port)
 
@@ -501,7 +546,7 @@ footer { position:fixed; bottom:0; left:0; right:0; background:#1d2026; padding:
 <body>
 <header><h1 id="hdr"></h1><div class="sub" id="hdr-sub"></div></header>
 <div class="layout" id="layout">
-  <aside id="season"><h2>Season slots</h2><div id="slots"></div></aside>
+  <aside id="season"><h2 id="slots-hdr">Season slots</h2><div id="slots"></div></aside>
   <main id="titles"></main>
 </div>
 <div id="done"><h2>✓ Review submitted</h2>
@@ -528,15 +573,23 @@ const THUMB = '/thumb/' + MODEL.nonce + '/';
 const $ = s => document.querySelector(s);
 const slotsEl = $('#slots'), titlesEl = $('#titles'), msgEl = $('#msg'), submitBtn = $('#submit');
 
-$('#hdr').textContent = (MODEL.show || 'Disc') + ' — Season ' + MODEL.season + ' review';
+$('#hdr').textContent = (MODEL.show || 'Disc') + ' — ' + MODEL.season_heading + ' review';
 $('#hdr-sub').textContent = MODEL.titles.length + ' title(s) ripped · '
-  + MODEL.episodes.length + ' episode(s) in the season guide · click a still to enlarge';
+  + MODEL.episodes.length + ' episode(s) in the guide · click a still to enlarge'
+  + (MODEL.multi_season ? ' · volume disc: pick the season each title belongs to' : '');
 
-const assignments = {};  // title_index -> episode int or null (= exclude)
+// title_index -> episode key (season-qualified; see identify.episode_key) or null
+// (= exclude). On a volume disc E10 exists in both seasons, so the key — not the
+// bare number — is what a slot is addressed by.
+const assignments = {};
 MODEL.titles.forEach(t => { assignments[t.title_index] = t.guess; });
 
 const pad = n => String(n).padStart(2, '0');
-const epTag = e => 'E' + pad(e.index) + (e.index_end ? '-E' + pad(e.index_end) : '');
+const epTag = e => (MODEL.multi_season && e.season != null ? 'S' + pad(e.season) : '')
+  + 'E' + pad(e.index) + (e.index_end ? '-E' + pad(e.index_end) : '');
+const tagByKey = {};
+MODEL.episodes.forEach(e => { tagByKey[e.key] = epTag(e); });
+$('#slots-hdr').textContent = MODEL.multi_season ? 'Episode slots (both seasons)' : 'Season slots';
 const fmtDur = s => s ? Math.floor(s / 60) + ':' + pad(s % 60) : '?:??';
 
 // --- title cards -----------------------------------------------------------
@@ -578,7 +631,7 @@ MODEL.titles.forEach(t => {
   const sel = document.createElement('select');
   sel.appendChild(new Option('— exclude (do not transfer) —', ''));
   MODEL.episodes.forEach(e =>
-    sel.appendChild(new Option(epTag(e) + (e.name ? ' — ' + e.name : ''), e.index)));
+    sel.appendChild(new Option(epTag(e) + (e.name ? ' — ' + e.name : ''), e.key)));
   sel.value = t.guess == null ? '' : String(t.guess);
   sel.addEventListener('change', () => {
     assignments[t.title_index] = sel.value === '' ? null : parseInt(sel.value, 10);
@@ -608,12 +661,12 @@ Object.values(cards).forEach(c => io.observe(c));
 // --- season panel + duplicate guard -----------------------------------------
 function refresh() {
   const byEp = {};
-  for (const [ti, ep] of Object.entries(assignments)) {
-    if (ep != null) (byEp[ep] = byEp[ep] || []).push(ti);
+  for (const [ti, key] of Object.entries(assignments)) {
+    if (key != null) (byEp[key] = byEp[key] || []).push(ti);
   }
   slotsEl.innerHTML = '';
   MODEL.episodes.forEach(e => {
-    const owners = byEp[e.index] || [];
+    const owners = byEp[e.key] || [];
     const div = document.createElement('div');
     div.className = 'slot ' + (owners.length === 0 ? 'empty' : owners.length > 1 ? 'dupe' : 'filled');
     const ep = document.createElement('span'); ep.className = 'ep'; ep.textContent = epTag(e);
@@ -632,7 +685,7 @@ function refresh() {
   msgEl.classList.remove('ok');
   if (dupes.length) {
     submitBtn.disabled = true;
-    msgEl.textContent = 'Episode ' + dupes.map(([k]) => k).join(', ')
+    msgEl.textContent = 'Episode ' + dupes.map(([k]) => tagByKey[k] || k).join(', ')
       + ' is assigned to more than one title — fix before submitting.';
   } else {
     submitBtn.disabled = false;

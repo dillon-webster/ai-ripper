@@ -49,7 +49,17 @@ def trigger_jellyfin_scan(config) -> None:
     log.info("Jellyfin library scan triggered")
 
 
-def send_review_ready(url: str, show: str, season: int, config) -> None:
+def _season_heading(season) -> str:
+    """'Season 2', or 'Seasons 4 + 5' when the disc is a volume spanning both."""
+    if isinstance(season, int) or season is None:
+        return f"Season {season}"
+    seasons = sorted({int(s) for s in season})
+    if len(seasons) == 1:
+        return f"Season {seasons[0]}"
+    return "Seasons " + " + ".join(str(s) for s in seasons)
+
+
+def send_review_ready(url: str, show: str, season, config) -> None:
     """Ping Discord that the review UI is up, with the link. @mentions the user when
     discord_mention_user_id is set so the message pings/badges instead of scrolling
     by. NOTE: Discord still suppresses the mobile push while a desktop client is
@@ -57,7 +67,7 @@ def send_review_ready(url: str, show: str, season: int, config) -> None:
     Discord to get the phone push. Retries 3×. Never raises."""
     mention = getattr(config, "discord_mention_user_id", "")
     prefix = f"<@{mention}> " if mention else ""
-    content = (f"{prefix}🖼️ **{show} Season {season}** is ripped and waiting for review:\n"
+    content = (f"{prefix}🖼️ **{show} {_season_heading(season)}** is ripped and waiting for review:\n"
                f"{url}\n"
                f"Open from any device on the tailnet (phone/laptop need Tailscale on).")
     payload = json.dumps({

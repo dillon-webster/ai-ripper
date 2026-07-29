@@ -201,14 +201,49 @@ python3 ripper.py --show "The Office" --season 8 --content-id --review-ui
 | Flag | What it does |
 |------|--------------|
 | `--show "Name"` | Exact show name to look up. Enables the episode guide. Requires `--season`. Overrides the name inferred from the disc label. |
-| `--season N` | Force the season for every disc this session (disc labels like `FAMILY_GUY_DISC1` carry no season). |
-| `--disc N` | Disc number within the season — a numbering hint when the server is empty. |
+| `--season N` | Force the season for every disc this session (disc labels like `FAMILY_GUY_DISC1` carry no season). Takes **two** seasons — `--season 4,5` or `4-5` — for a volume disc; see below. |
+| `--disc N` | Disc number **within the season** — a numbering hint for the playback-order fallback when the server is empty. Ignored on a volume disc (`--season 4,5`), where it has no meaning. |
 | `--content-id` | Identify each title by its content (subtitles → OCR, frames → vision) instead of playback order. Requires `--show` and `--season`. |
 | `--dry-run` | Rip + name + print the mapping, then stop. Nothing written; disc kept. |
 | `--approve` | One-tap Approve/Fix over Discord before transfer. |
 | `--review-ui` | Hand-curate the mapping in a local web page before transfer. |
+| `--once` | Handle one disc and exit, instead of looping for the next one. |
 
-Overrides apply to **every disc until the ripper is restarted.**
+### When a disc isn't one season
+
+Some shows were never released by season. Family Guy shipped as **Volumes 1–12**, and
+a volume is just "the next ~28 episodes we hadn't put on a disc yet" — so a season is
+split across two volumes, and one disc inside a volume can hold the last few episodes
+of one season and the first few of the next.
+
+```bash
+python3 ripper.py --show "Family Guy" --season 4,5 --content-id --review-ui --once
+```
+
+No `--disc` here on purpose: it means "disc N *of that season*", and disc 2 of Volume 8
+is not disc 2 of season 7 — a volume's discs don't line up with either season's disc
+order. Pass it anyway and it's ignored, with a line in the log saying so.
+
+Naming both seasons fetches the episode guide for both and puts all of them in one
+candidate pool. Each title is then named from the season of the episode it actually
+**matched**, so the boundary lands where the content says rather than where you
+guessed — `Family.Guy.S04E30.mkv` and `Family.Guy.S05E01.mkv` off the same disc. The
+review page shows both seasons' slots, labelled `S04E30` / `S05E01` so the two E01s
+can't be confused.
+
+Over-specifying is cheap: a disc that turns out to be all season 4 still comes out
+right, it just considered more candidates. At most 3 seasons, and only one season?
+Nothing changes — `--season 4` as always.
+
+Two caveats. This leans on content matching being right across a doubled candidate
+pool, so keep `--review-ui` on for these. And if content-ID can't match anything, the
+legacy playback-order namer takes over — it can't span a boundary and will number
+everything into the lower season, which it says loudly in the log.
+
+Overrides apply to **every disc until the ripper is restarted** — which is what
+`--once` is for. Without it, a one-off run with `--show`/`--season` stays in force,
+so the next disc you put in (a movie, another show) is named as an episode of this
+season. Use `--once` for anything hand-run; leave it off for the daemon.
 
 ## Running tests
 

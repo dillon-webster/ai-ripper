@@ -502,3 +502,99 @@ def test_identify_title_returns_none_when_no_signal(tmp_path):
 
     assert result["episode"] is None
     assert result["method"] == "none"
+
+
+# --- volume discs: two seasons in one candidate pool -------------------------
+#
+# A volume box set isn't a season set. Family Guy shipped as Volumes 1-12, and one
+# disc inside a volume can hold the last episodes of one season and the first of the
+# next — so the candidate pool spans a boundary and the bare episode number stops
+# being an identity (S04E10 and S05E10 are different episodes).
+
+VOLUME_CANDIDATES = [
+    {"season": 4, "index": 29, "index_end": None, "name": "PTV", "runtime_secs": 1320},
+    {"season": 4, "index": 30, "index_end": None, "name": "Brian Sings", "runtime_secs": 1320},
+    {"season": 5, "index": 1, "index_end": None, "name": "Stewie Loves Lois", "runtime_secs": 1320},
+    {"season": 5, "index": 2, "index_end": None, "name": "Mother Tucker", "runtime_secs": 1320},
+]
+
+
+def _vt(title_index, season, episode, duration, confidence=0.95):
+    return {"title_index": title_index, "season": season, "episode": episode,
+            "index_end": None, "duration_secs": duration, "confidence": confidence}
+
+
+def test_episode_key_is_season_qualified_and_order_preserving():
+    assert identify.episode_key(4, 29) < identify.episode_key(5, 1)
+    assert identify.episode_key(4, 10) != identify.episode_key(5, 10)
+    assert identify.split_key(identify.episode_key(4, 29)) == (4, 29)
+    # No season → the bare episode number, so the single-season path is unchanged.
+    assert identify.episode_key(None, 7) == 7
+    assert identify.split_key(7) == (None, 7)
+
+
+def test_candidate_lines_are_season_qualified_only_when_seasons_span():
+    lines = _candidate_lines(VOLUME_CANDIDATES)
+    assert "S04E29" in lines and "S05E01" in lines
+    # One season → the proven single-season rendering, untouched.
+    assert "S01" not in _candidate_lines(CANDIDATES)
+
+
+def test_subtitle_prompt_asks_for_a_season_on_a_volume_disc():
+    prompt = _build_subtitle_prompt("dialogue", VOLUME_CANDIDATES, 1320)
+    assert '"season"' in prompt
+    assert "VOLUME box set" in prompt
+    # The single-season prompt never mentions a season field — that path is proven.
+    assert '"season"' not in _build_subtitle_prompt("dialogue", CANDIDATES, 1320)
+
+
+def test_parse_match_keeps_the_season_the_model_chose():
+    result = _parse_match('{"season": 5, "episode": 1, "confidence": 0.93}',
+                          VOLUME_CANDIDATES, "subtitles")
+    assert (result["season"], result["episode"]) == (5, 1)
+
+
+def test_parse_match_rejects_an_episode_from_the_wrong_season():
+    # S05E29 is not a listed pair (29 belongs to season 4) — unmatched beats misfiled.
+    result = _parse_match('{"season": 5, "episode": 29, "confidence": 0.9}',
+                          VOLUME_CANDIDATES, "subtitles")
+    assert result["episode"] is None
+
+
+def test_parse_match_infers_the_sole_season_when_only_one_is_in_play():
+    single = [{**c, "season": 2} for c in CANDIDATES]
+    result = _parse_match('{"episode": 2, "confidence": 0.9}', single, "subtitles")
+    assert (result["season"], result["episode"]) == (2, 2)
+
+
+def test_reconcile_keeps_the_same_episode_number_from_both_seasons():
+    """The collision this whole thing exists for: a disc holding S04E10 and S05E10
+    must keep both, not treat the second as a duplicate of the first."""
+    result = reconcile([_vt(0, 4, 10, 1320), _vt(1, 5, 10, 1320)])
+    assert [(t["season"], t["episode"]) for t in result["kept"]] == [(4, 10), (5, 10)]
+    assert result["dropped"] == []
+
+
+def test_reconcile_treats_a_season_boundary_as_contiguous():
+    """S04E30 → S05E01 is one continuous block, so a low-confidence title at the seam
+    is anchored by its neighbors — not dropped as an isolated off-disc match."""
+    runtimes = {identify.episode_key(c["season"], c["index"]): 1320 for c in VOLUME_CANDIDATES}
+    keys = sorted(runtimes)
+    titles = [_vt(0, 4, 29, 1320), _vt(1, 4, 30, 1320),
+              _vt(2, 5, 1, 1320, confidence=0.55), _vt(3, 5, 2, 1320)]
+    result = reconcile(titles, episode_runtimes=runtimes, guide_keys=keys)
+    assert [(t["season"], t["episode"]) for t in result["kept"]] == [(4, 29), (4, 30), (5, 1), (5, 2)]
+
+
+def test_reconcile_sorts_across_seasons_in_broadcast_order():
+    result = reconcile([_vt(0, 5, 2, 1320), _vt(1, 4, 29, 1320), _vt(2, 5, 1, 1320)])
+    assert [(t["season"], t["episode"]) for t in result["kept"]] == [(4, 29), (5, 1), (5, 2)]
+
+
+def test_build_named_title_uses_the_titles_own_season():
+    """Each episode is filed under the season it MATCHED, not the run's first season."""
+    nt = build_named_title(_vt(0, 5, 1, 1320), "Family Guy", 4)
+    assert nt["jellyfin_filename"] == "Family.Guy.S05E01.mkv"
+    # No season on the title (single-season path) → the run's season still applies.
+    assert build_named_title({"episode": 3}, "Family Guy", 4)["jellyfin_filename"] \
+        == "Family.Guy.S04E03.mkv"

@@ -427,8 +427,11 @@ def test_main_loop_review_ui_transfers_curated_titles(tmp_path):
     # The review got the FULL rip list plus the proposal and the guide.
     args = mock_review.call_args[0]
     assert args[0] == raw_titles          # all_titles
-    assert args[3] == guide               # guide
-    assert args[4:6] == ("The Office", 1)
+    # The guide reaches the review page season-tagged (so a volume disc can show two
+    # seasons of slots), and the season override travels as a list.
+    assert args[3] == [{**e, "season": 1} for e in guide]
+    assert args[4] == "The Office"
+    assert args[5] == [1]
     # And exactly the curated list transferred.
     assert mock_send.call_args[0][0] is curated
     mock_cleanup.assert_called_once()
@@ -559,3 +562,314 @@ def test_main_loop_review_ui_supersedes_approve(tmp_path):
 
     mock_approve.assert_not_called()  # Discord gate skipped this run
     mock_send.assert_called_once()
+
+
+def test_main_loop_once_exits_after_a_single_disc(tmp_path):
+    """--once handles one disc and returns, instead of looping to wait for another.
+
+    Without it a one-off run with --show/--season keeps that override in force, so
+    the NEXT disc inserted gets named as an episode of this season."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "FRIENDS_S1D1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    named_titles = _make_named_titles(tmp_path)
+
+    # Two discs are queued. A looping ripper would pick up the second one; --once
+    # must leave it untouched.
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("FRIENDS_S1D1", disc_path), ("FRIENDS_S1D2", disc_path)]) as mock_wait, \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles) as mock_rip, \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.namer.identify", return_value=named_titles), \
+         patch("ripper.transfer.send_all"), \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc") as mock_eject:
+        import ripper
+        ripper.main(once=True)  # returns on its own — no StopIteration needed
+
+    assert mock_wait.call_count == 1
+    assert mock_rip.call_count == 1
+    mock_eject.assert_called_once()  # the disc it did handle still gets ejected
+
+
+def test_main_loop_once_exits_even_when_the_rip_is_held(tmp_path):
+    """A held review/approval keeps the files and the disc — and with --once it
+    must still end the run rather than sit waiting for a disc that can't come out."""
+    from modules.review_ui import ReviewDecision
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_DISC1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    guide = [{"index": 1, "index_end": None, "name": "Pilot", "runtime_secs": 1404}]
+    identified = [{**raw_titles[0], "episode": 1, "index_end": None,
+                   "confidence": 0.9, "method": "subtitles"}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_DISC1", disc_path), ("SOME_MOVIE", disc_path)]) as mock_wait, \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=guide), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.review_ui_mod.request_review",
+               return_value=ReviewDecision(False, "timed out", titles=[])), \
+         patch("ripper.transfer.send_all") as mock_send, \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp") as mock_cleanup, \
+         patch("ripper.eject_disc") as mock_eject:
+        import ripper
+        ripper.main(season=1, show="The Office", content_id=True, review_ui=True, once=True)
+
+    assert mock_wait.call_count == 1
+    mock_send.assert_not_called()
+    mock_cleanup.assert_not_called()  # held: files kept for manual handling
+    mock_eject.assert_not_called()    # held: disc left in the drive
+
+
+def test_main_loop_without_once_keeps_watching_after_a_disc(tmp_path):
+    """The daemon's default is unchanged: one disc done, straight back to waiting."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "FRIENDS_S1D1"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    named_titles = _make_named_titles(tmp_path)
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("FRIENDS_S1D1", disc_path), StopIteration]) as mock_wait, \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.namer.identify", return_value=named_titles), \
+         patch("ripper.transfer.send_all"), \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main()
+
+    assert mock_wait.call_count == 2  # went back for another disc
+
+
+# --- volume discs (two seasons on one disc) ----------------------------------
+
+def test_seasons_arg_accepts_one_season_a_list_and_a_range():
+    import ripper
+    assert ripper._seasons_arg("4") == [4]
+    assert ripper._seasons_arg("4,5") == [4, 5]
+    assert ripper._seasons_arg("4-6") == [4, 5, 6]
+    assert ripper._seasons_arg("5,4,4") == [4, 5]   # sorted + deduped
+    assert ripper._seasons_arg("4,") == [4]         # trailing comma is unambiguous
+
+
+def test_seasons_arg_refuses_anything_ambiguous():
+    import argparse
+
+    import ripper
+    # A mistyped season silently misnames a whole disc — refuse rather than guess.
+    for bad in ("", "abc", "6-4", "4,x", "100", "-1", "4,5,6,7"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            ripper._seasons_arg(bad)
+
+
+def test_as_seasons_normalizes_int_list_and_none():
+    import ripper
+    assert ripper.as_seasons(4) == [4]
+    assert ripper.as_seasons([5, 4]) == [4, 5]
+    assert ripper.as_seasons(None) == []
+
+
+def test_fetch_guide_pools_both_seasons_in_broadcast_order(tmp_path):
+    """A volume disc's candidate pool is both seasons at once, each entry tagged with
+    the season it came from."""
+    import ripper
+    config = _make_config(tmp_path)
+    by_season = {
+        4: [{"index": 29, "name": "PTV"}, {"index": 30, "name": "Brian Sings"}],
+        5: [{"index": 1, "name": "Stewie Loves Lois"}],
+    }
+    with patch("ripper.episode_guide.get_season_episodes",
+               side_effect=lambda show, s, cfg: by_season[s]):
+        guide = ripper.fetch_guide("Family Guy", [4, 5], config)
+
+    assert [(e["season"], e["index"]) for e in guide] == [(4, 29), (4, 30), (5, 1)]
+
+
+def test_fetch_guide_keeps_the_seasons_it_can_when_one_lookup_fails(tmp_path):
+    """Half a pool still matches half the disc; the rest surfaces as unmatched at the
+    review gate instead of sinking the whole guide."""
+    import ripper
+    from modules.episode_guide import EpisodeGuideError
+    config = _make_config(tmp_path)
+
+    def fake(show, s, cfg):
+        if s == 5:
+            raise EpisodeGuideError("TMDB down")
+        return [{"index": 29, "name": "PTV"}]
+
+    with patch("ripper.episode_guide.get_season_episodes", side_effect=fake):
+        guide = ripper.fetch_guide("Family Guy", [4, 5], config)
+    assert [(e["season"], e["index"]) for e in guide] == [(4, 29)]
+
+    with patch("ripper.episode_guide.get_season_episodes",
+               side_effect=EpisodeGuideError("all down")):
+        assert ripper.fetch_guide("Family Guy", [4, 5], config) is None
+
+
+def test_main_loop_names_a_volume_disc_from_both_seasons(tmp_path):
+    """The whole point: one disc, two seasons, and each title filed under the season
+    of the episode it actually matched — not all forced into the first one."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "FAMILY_GUY_VOL4_D3"
+    disc_path.mkdir()
+
+    raw_titles = [
+        {"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0},
+        {"path": disc_path / "title_t01.mkv", "duration_secs": 1320, "title_index": 1},
+    ]
+    by_season = {
+        4: [{"index": 30, "index_end": None, "name": "Brian Sings", "runtime_secs": 1320}],
+        5: [{"index": 1, "index_end": None, "name": "Stewie Loves Lois", "runtime_secs": 1320}],
+    }
+    # The disc straddles the boundary: one title from each season.
+    identified = [
+        {**raw_titles[0], "season": 4, "episode": 30, "index_end": None,
+         "confidence": 0.95, "method": "subtitles"},
+        {**raw_titles[1], "season": 5, "episode": 1, "index_end": None,
+         "confidence": 0.95, "method": "subtitles"},
+    ]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("FAMILY_GUY_VOL4_D3", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes",
+               side_effect=lambda show, s, cfg: by_season[s]), \
+         patch("ripper.identify.identify_title", side_effect=identified), \
+         patch("ripper.namer.identify") as mock_namer, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]) as mock_send, \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=[4, 5], show="Family Guy", content_id=True)
+
+    mock_namer.assert_not_called()
+    sent = mock_send.call_args[0][0]
+    assert [t["jellyfin_filename"] for t in sent] == \
+        ["Family.Guy.S04E30.mkv", "Family.Guy.S05E01.mkv"]
+    # The episode names come from the right season's guide, too.
+    assert [t["episode_name"] for t in sent] == ["Brian Sings", "Stewie Loves Lois"]
+
+
+def test_main_loop_volume_disc_identifies_against_both_seasons_at_once(tmp_path):
+    """Every title is offered the whole pool — a disc that turns out to be all one
+    season still comes out right, it just considered more candidates."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "FAMILY_GUY_VOL4_D3"
+    disc_path.mkdir()
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    by_season = {
+        4: [{"index": 30, "index_end": None, "name": "Brian Sings", "runtime_secs": 1320}],
+        5: [{"index": 1, "index_end": None, "name": "Stewie Loves Lois", "runtime_secs": 1320}],
+    }
+    identified = [{**raw_titles[0], "season": 4, "episode": 30, "index_end": None,
+                   "confidence": 0.95, "method": "subtitles"}]
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("FAMILY_GUY_VOL4_D3", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes",
+               side_effect=lambda show, s, cfg: by_season[s]), \
+         patch("ripper.identify.identify_title", side_effect=identified) as mock_identify, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]), \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=[4, 5], show="Family Guy", content_id=True)
+
+    candidates = mock_identify.call_args[0][1]
+    assert [(c["season"], c["index"]) for c in candidates] == [(4, 30), (5, 1)]
+
+
+def test_volume_disc_withholds_the_disc_number_from_the_legacy_namer(tmp_path):
+    """Disc 2 of Volume 8 is not disc 2 of season 7. The legacy namer reads --disc as
+    'disc N of THAT season', so on a volume disc the hint is withheld rather than
+    asserted falsely."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "FAMILY_GUY_VOL8_D2"
+    disc_path.mkdir()
+
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    by_season = {
+        7: [{"index": 16, "index_end": None, "name": "a", "runtime_secs": 1320}],
+        8: [{"index": 1, "index_end": None, "name": "b", "runtime_secs": 1320}],
+    }
+    # Content-ID matches nothing → the legacy namer takes over.
+    unmatched = [{**raw_titles[0], "season": None, "episode": None, "index_end": None,
+                  "confidence": 0.0, "method": "none"}]
+    named_titles = _make_named_titles(tmp_path)
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("FAMILY_GUY_VOL8_D2", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes",
+               side_effect=lambda show, s, cfg: by_season[s]), \
+         patch("ripper.identify.identify_title", side_effect=unmatched), \
+         patch("ripper.namer.identify", return_value=named_titles) as mock_namer, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]), \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=[7, 8], disc=2, show="Family Guy", content_id=True)
+
+    assert mock_namer.call_args.kwargs["disc"] is None
+    assert mock_namer.call_args.kwargs["season"] == 7   # still the lower season
+
+
+def test_single_season_disc_still_passes_the_disc_number(tmp_path):
+    """The hint is real when the disc IS one season's — that path is untouched."""
+    config = _make_config(tmp_path)
+    disc_path = tmp_path / "THE_OFFICE_S2D2"
+    disc_path.mkdir()
+    raw_titles = [{"path": disc_path / "title_t00.mkv", "duration_secs": 1320, "title_index": 0}]
+    named_titles = _make_named_titles(tmp_path)
+
+    with patch("ripper.load_config", return_value=config), \
+         patch("ripper.disc_watcher.wait_for_disc",
+               side_effect=[("THE_OFFICE_S2D2", disc_path), StopIteration]), \
+         patch("ripper.disc_ripper.rip", return_value=raw_titles), \
+         patch("ripper.transfer.list_existing_episodes", return_value=[]), \
+         patch("ripper.episode_guide.get_season_episodes", return_value=[]), \
+         patch("ripper.namer.identify", return_value=named_titles) as mock_namer, \
+         patch("ripper.transfer.send_all", return_value=["remote/path"]), \
+         patch("ripper.notifier.trigger_jellyfin_scan"), \
+         patch("ripper.notifier.send_discord"), \
+         patch("ripper.cleanup_temp"), \
+         patch("ripper.eject_disc"):
+        with pytest.raises(StopIteration):
+            import ripper
+            ripper.main(season=2, disc=2, show="The Office")
+
+    assert mock_namer.call_args.kwargs["disc"] == 2

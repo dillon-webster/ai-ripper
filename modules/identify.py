@@ -111,6 +111,51 @@ class IdentifyError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Season-qualified episode keys
+# ---------------------------------------------------------------------------
+
+# A disc isn't always one season. A volume box set (Family Guy shipped as Volumes
+# 1-12) can hold the tail of one season and the head of the next, so the candidate
+# pool spans two seasons — and there the bare episode number is no longer an
+# identity: S04E10 and S05E10 are different episodes with the same number. Everything
+# downstream of matching (dedup, adjacency, slot assignment) therefore keys on this
+# composite instead. The encoding is order-preserving — sorting keys sorts
+# chronologically — because no season has 1000 episodes.
+#
+# `season is None` (a guide with no season attached: the legacy single-season path
+# and most tests) keys on the plain episode number, so that path is untouched.
+_SEASON_KEY_STRIDE = 1000
+
+
+def episode_key(season: Optional[int], index: int) -> int:
+    """The identity of one episode slot: season-qualified when a season is known."""
+    if season is None:
+        return index
+    return season * _SEASON_KEY_STRIDE + index
+
+
+def split_key(key: int) -> tuple:
+    """Inverse of `episode_key`: (season, index), with season None if unqualified."""
+    if key >= _SEASON_KEY_STRIDE:
+        return divmod(key, _SEASON_KEY_STRIDE)
+    return None, key
+
+
+def _title_key(title: Dict) -> int:
+    return episode_key(title.get("season"), title["episode"])
+
+
+def _ep_label(season: Optional[int], index: int) -> str:
+    """How an episode reads in a log line or a drop reason: E05, or S04E05 when the
+    run spans seasons and the number alone would be ambiguous."""
+    return (f"S{season:02d}" if season is not None else "") + f"E{index:02d}"
+
+
+def _seasons_of(candidates: List[Dict]) -> List[int]:
+    return sorted({c["season"] for c in candidates if c.get("season") is not None})
+
+
+# ---------------------------------------------------------------------------
 # Candidate rendering + LLM matching (pure / mockable)
 # ---------------------------------------------------------------------------
 
@@ -125,10 +170,15 @@ def _candidate_lines(candidates: List[Dict]) -> str:
     Each line carries the plot overview when available — matching OCR'd dialogue
     against real summaries (not just cryptic "The One with..." titles) is what lets
     the model tell serialized-arc / same-length episodes apart.
+
+    When the pool spans two seasons (a volume disc), every line is season-qualified —
+    E10 alone would name two different episodes.
     """
+    multi = len(_seasons_of(candidates)) > 1
     lines = []
     for c in candidates:
-        rng = f"E{c['index']:02d}" + (f"-E{c['index_end']:02d}" if c.get("index_end") else "")
+        season = f"S{c['season']:02d}" if multi else ""
+        rng = season + f"E{c['index']:02d}" + (f"-E{c['index_end']:02d}" if c.get("index_end") else "")
         nm = f' "{c["name"]}"' if c.get("name") else ""
         dur = f" (~{round(c['runtime_secs'] / 60)} min)" if c.get("runtime_secs") else ""
         lines.append(f"  {rng}{nm}{dur}")
@@ -154,6 +204,42 @@ _MATCH_RULES = (
     "title far longer than EVERY candidate is a 'Play All' compilation → null.\n"
 )
 
+# Added only when the candidate pool spans seasons (a volume disc). The single-season
+# prompt — the proven one — is left exactly as it was.
+_MULTI_SEASON_RULES = (
+    "Return ONLY a JSON object, no other text:\n"
+    '{"season": <season int, or null>, "episode": <IndexNumber int, or null>, '
+    '"index_end": <int or null>, "confidence": <0.0-1.0>, "reasoning": "<one short sentence>"}\n'
+    "Rules:\n"
+    "- This disc comes from a VOLUME box set, not a season set: it holds the last "
+    "episodes of one season and the first of the next. Either season is a valid answer, "
+    "so judge purely by the content — do not assume the disc is all one season.\n"
+    "- \"season\" and \"episode\" MUST together name a listed candidate (the season is "
+    "part of each line, e.g. S04E22). Never invent a number, and never pair an episode "
+    "number with the other season.\n"
+    "- Set both to null if the content matches NO listed episode (a bonus feature, menu, "
+    "or 'Play All' compilation of several episodes) — do not force a guess.\n"
+    "- Set \"index_end\" only if you matched a listed episode that shows a spanning range "
+    "(e.g. E12-E13); otherwise null.\n"
+    "- Judge primarily by plot/dialogue. The ripped title's runtime is given above: when "
+    "exactly one candidate's runtime is close to it and the others are not, that is strong "
+    "corroborating evidence — prefer it unless the dialogue clearly points elsewhere. A "
+    "title far longer than EVERY candidate is a 'Play All' compilation → null.\n"
+)
+
+
+def _match_rules(candidates: List[Dict]) -> str:
+    return _MULTI_SEASON_RULES if len(_seasons_of(candidates)) > 1 else _MATCH_RULES
+
+
+def _candidate_header(candidates: List[Dict]) -> str:
+    seasons = _seasons_of(candidates)
+    if len(seasons) > 1:
+        listed = " and ".join(str(s) for s in seasons)
+        return (f"Candidate episodes for seasons {listed} — this disc spans the boundary "
+                "between them (the ONLY valid answers):")
+    return "Candidate episodes for this season (the ONLY valid answers):"
+
 
 def _runtime_line(duration_secs) -> str:
     if not duration_secs:
@@ -165,12 +251,12 @@ def _build_subtitle_prompt(dialogue: str, candidates: List[Dict], duration_secs=
     return (
         "You are identifying which TV episode a ripped disc title contains, to number it "
         "for a Jellyfin library. Match the dialogue below to exactly one episode.\n\n"
-        "Candidate episodes for this season (the ONLY valid answers):\n"
+        f"{_candidate_header(candidates)}\n"
         f"{_candidate_lines(candidates)}\n\n"
         f"{_runtime_line(duration_secs)}"
         "Subtitle dialogue sampled across the title (OCR'd from the disc — may contain "
         f"OCR errors):\n\"\"\"\n{dialogue.strip()}\n\"\"\"\n\n"
-        f"{_MATCH_RULES}"
+        f"{_match_rules(candidates)}"
     )
 
 
@@ -180,10 +266,10 @@ def _build_frame_prompt(candidates: List[Dict], duration_secs=None) -> str:
         "for a Jellyfin library. The images are frames sampled from the title (a teaser "
         "shot and two later scenes; the shared opening-title montage is skipped). Match "
         "them to exactly one episode.\n\n"
-        "Candidate episodes for this season (the ONLY valid answers):\n"
+        f"{_candidate_header(candidates)}\n"
         f"{_candidate_lines(candidates)}\n\n"
         f"{_runtime_line(duration_secs)}"
-        f"{_MATCH_RULES}"
+        f"{_match_rules(candidates)}"
     )
 
 
@@ -210,7 +296,9 @@ def _parse_match(raw: str, candidates: List[Dict], method: str) -> Dict:
 
     An out-of-list episode number is treated as 'no confident match' (episode=None)
     rather than trusted — the whole point is to never number a title as an episode
-    that doesn't exist in the season.
+    that doesn't exist in the season. When the pool spans seasons the SEASON is
+    clamped the same way: the pair must name a listed candidate, so a model that
+    answers S05E10 for a season-4-only number lands as unmatched, not misfiled.
     """
     try:
         data = json.loads(_extract_json(raw))
@@ -218,13 +306,25 @@ def _parse_match(raw: str, candidates: List[Dict], method: str) -> Dict:
         raise IdentifyError(f"Malformed match JSON: {e}") from e
 
     episode = data.get("episode")
-    valid = {c["index"] for c in candidates}
-    if episode is not None and episode not in valid:
-        log.warning(f"Model returned episode {episode} not in candidate list; treating as unmatched")
+    seasons = {c.get("season") for c in candidates}
+    # One season in the pool → the model was never asked for one (the single-season
+    # prompt has no season field), so the sole season is implied.
+    season = data.get("season") if len(seasons) > 1 else next(iter(seasons), None)
+    if season is not None:
+        try:
+            season = int(season)
+        except (TypeError, ValueError):
+            season = None
+
+    valid = {(c.get("season"), c["index"]) for c in candidates}
+    if episode is not None and (season, episode) not in valid:
+        log.warning(f"Model returned {_ep_label(season, episode)} — not in the candidate "
+                    "list; treating as unmatched")
         episode = None
 
     index_end = data.get("index_end") if episode is not None else None
     return {
+        "season": season if episode is not None else None,
         "episode": episode,
         "index_end": index_end,
         "confidence": float(data.get("confidence") or 0.0),
@@ -461,7 +561,7 @@ def identify_title(title: Dict, candidates: List[Dict], config) -> Dict:
                 log.warning(f"{mkv.name}: frame match failed ({e})")
 
     log.warning(f"{mkv.name}: could not identify (no subtitles, no frames)")
-    return {**title, "episode": None, "index_end": None,
+    return {**title, "season": None, "episode": None, "index_end": None,
             "confidence": 0.0, "reasoning": "no usable content signal", "method": "none"}
 
 
@@ -474,41 +574,90 @@ def build_filename(show: str, season: int, episode: int, index_end: int = None) 
 
 def build_named_title(title: Dict, show: str, season: int) -> Dict:
     """Merge a reconciled title with the transfer-ready naming fields the rest of the
-    pipeline (transfer.send_all) expects — the same shape namer.identify produces."""
+    pipeline (transfer.send_all) expects — the same shape namer.identify produces.
+
+    The title's OWN season wins when it has one: on a volume disc that spans a
+    boundary, each episode is filed under the season it actually matched, not under
+    whichever season the run was launched with. `season` is the fallback for titles
+    carrying none (the single-season path)."""
+    ep_season = title.get("season")
+    if ep_season is None:
+        ep_season = season
     return {
         **title,
-        "jellyfin_filename": build_filename(show, season, title["episode"], title.get("index_end")),
+        "jellyfin_filename": build_filename(show, ep_season, title["episode"],
+                                            title.get("index_end")),
         "media_type": "tv",
         "destination": "tvshows",
         "is_extra": False,
     }
 
 
-def _covered_numbers(t: Dict) -> set:
-    """Episode numbers a title spans: {episode}, or {episode..index_end} for a range."""
-    lo = t["episode"]
-    hi = t.get("index_end") or lo
+def _covered_keys(t: Dict) -> set:
+    """Episode keys a title spans: {key}, or the range for a double-episode slot. A
+    spanning range never crosses a season, so plain key arithmetic holds."""
+    lo = _title_key(t)
+    end = t.get("index_end")
+    hi = episode_key(t.get("season"), end) if end else lo
     return set(range(lo, hi + 1))
 
 
-def _adjacent_open_slots(claimed: set, episode_runtimes: Dict[int, int]) -> set:
-    """Unclaimed episode numbers bordering the disc's block (one step beyond min/max, or
+def _key_sequence(episode_runtimes: Dict[int, int], guide_keys=None) -> tuple:
+    """The ordered universe of episode keys, plus key→position.
+
+    Adjacency is defined over this SEQUENCE, not over key arithmetic: on a volume disc
+    the episode after S04E25 is S05E01, whose key is nowhere near it. With one season
+    the sequence is the season's episode numbers, so ±1 in position is ±1 in number and
+    nothing about the single-season behavior changes."""
+    seq = sorted(guide_keys) if guide_keys else sorted(episode_runtimes)
+    return seq, {k: i for i, k in enumerate(seq)}
+
+
+def _adjacent_open_slots(claimed: set, episode_runtimes: Dict[int, int],
+                         seq: List[int], pos: Dict[int, int]) -> set:
+    """Unclaimed episode keys bordering the disc's block (one step beyond either end, or
     an interior gap) that the guide knows a runtime for — the only slots an off-disc
     match may be reassigned into."""
     if not claimed or not episode_runtimes:
         return set()
-    lo, hi = min(claimed), max(claimed)
-    return {e for e in range(lo - 1, hi + 2) if e not in claimed and e in episode_runtimes}
+    places = [pos[k] for k in claimed if k in pos]
+    if not places:
+        # No guide sequence to walk (legacy callers pass runtimes only) — neighbors
+        # are the numerically adjacent keys, as before.
+        lo, hi = min(claimed), max(claimed)
+        return {e for e in range(lo - 1, hi + 2) if e not in claimed and e in episode_runtimes}
+    lo, hi = min(places), max(places)
+    window = {seq[i] for i in range(max(0, lo - 1), min(len(seq), hi + 2))}
+    return {k for k in window - claimed if k in episode_runtimes}
+
+
+def _neighborhood(t: Dict, seq: List[int], pos: Dict[int, int]) -> set:
+    """The keys a title touches plus the slots either side of them, in guide order."""
+    out = set()
+    for k in _covered_keys(t):
+        out.add(k)
+        i = pos.get(k)
+        if i is None:
+            out.update({k - 1, k + 1})
+            continue
+        if i > 0:
+            out.add(seq[i - 1])
+        if i + 1 < len(seq):
+            out.add(seq[i + 1])
+    return out
 
 
 def _resolve_isolated_matches(kept: List[Dict], dropped: List[Dict],
-                              episode_runtimes: Dict[int, int]) -> List[Dict]:
+                              episode_runtimes: Dict[int, int],
+                              seq: List[int] = None, pos: Dict[int, int] = None) -> List[Dict]:
     """Handle kept titles that sit alone (no episode at ±1) AND matched below
     ISOLATED_MATCH_MIN_CONFIDENCE — the fingerprint of an off-disc match: either a bonus
     reel force-matched to an episode not on this disc, OR a real on-disc episode the
     model matched to a same-length episode elsewhere in the season (S3's two ~42-min
     episodes E10/E23). For the latter we REASSIGN by runtime to an adjacent on-disc
-    episode; titles with no fit are dropped.
+    episode; titles with no fit are dropped. On a volume disc "adjacent" follows the
+    guide ACROSS the season boundary — the slot after S04E25 is S05E01 — so a disc that
+    straddles one isn't read as two isolated fragments.
 
     Assignment is one-slot-one-title: several isolated ~42-min titles (a real finale AND
     a same-length bonus 'Play All') can all fit the lone open E23, so the CLOSEST runtime
@@ -520,11 +669,13 @@ def _resolve_isolated_matches(kept: List[Dict], dropped: List[Dict],
     titles carry a reason for the approval step."""
     if len(kept) < 3:
         return kept
+    if seq is None or pos is None:
+        seq, pos = _key_sequence(episode_runtimes)
 
     anchored, isolated = [], []
     for t in kept:
-        neighborhood = {n for m in _covered_numbers(t) for n in (m - 1, m, m + 1)}
-        others = {n for o in kept if o is not t for n in _covered_numbers(o)}
+        neighborhood = _neighborhood(t, seq, pos)
+        others = {n for o in kept if o is not t for n in _covered_keys(o)}
         if (neighborhood & others) or t.get("confidence", 1.0) >= ISOLATED_MATCH_MIN_CONFIDENCE:
             anchored.append(t)
         else:
@@ -532,8 +683,8 @@ def _resolve_isolated_matches(kept: List[Dict], dropped: List[Dict],
     if not isolated:
         return kept
 
-    claimed = {n for o in anchored for n in _covered_numbers(o)}
-    open_slots = _adjacent_open_slots(claimed, episode_runtimes)
+    claimed = {n for o in anchored for n in _covered_keys(o)}
+    open_slots = _adjacent_open_slots(claimed, episode_runtimes, seq, pos)
 
     # Every (title, slot) pair within runtime tolerance, best fit first. Greedily claim
     # each slot for its closest title (ties broken by higher confidence); a title or slot
@@ -556,32 +707,43 @@ def _resolve_isolated_matches(kept: List[Dict], dropped: List[Dict],
 
     survivors = list(anchored)
     for t in isolated:
-        ep = t["episode"]
-        e = reassign.get(id(t))
-        if e is not None:
+        was = _ep_label(t.get("season"), t["episode"])
+        slot = reassign.get(id(t))
+        if slot is not None:
+            # The slot carries its own season: a reassignment can legitimately cross the
+            # boundary on a volume disc (an isolated title that really is S05E01).
+            slot_season, slot_ep = split_key(slot)
+            if slot_season is None:
+                slot_season = t.get("season")
+            now = _ep_label(slot_season, slot_ep)
             log.info(f"Content-ID: reassigning title #{t.get('title_index')} "
-                     f"E{ep:02d}->E{e:02d} (off-disc match; runtime fits the "
+                     f"{was}->{now} (off-disc match; runtime fits the "
                      "adjacent on-disc episode)")
             survivors.append({
-                **t, "episode": e, "index_end": None,
+                **t, "season": slot_season, "episode": slot_ep, "index_end": None,
                 "method": f"{t.get('method', '')}+runtime-repair".lstrip("+"),
-                "reasoning": f"content matched E{ep:02d} (off-disc, same length); "
-                             f"reassigned to adjacent on-disc E{e:02d} by runtime",
+                "reasoning": f"content matched {was} (off-disc, same length); "
+                             f"reassigned to adjacent on-disc {now} by runtime",
             })
         else:
             dropped.append({**t, "drop_reason":
-                            f"isolated low-confidence match (E{ep:02d}, "
+                            f"isolated low-confidence match ({was}, "
                             f"conf {t.get('confidence', 1.0):.2f}) — not adjacent to the "
                             "disc's episode block; likely a bonus reel"})
     return survivors
 
 
-def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -> Dict:
-    """Map identified titles onto real episode numbers, dropping duplicates and bonuses.
+def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None,
+              guide_keys: List[int] = None) -> Dict:
+    """Map identified titles onto real episode slots, dropping duplicates and bonuses.
 
-    `episode_runtimes` maps episode number → real runtime (secs), from the Jellyfin
-    guide; used to spot 'Play All'/omnibus titles by length. Optional: without it a
-    fallback single-episode length is derived from the matched titles' own durations.
+    Slots are addressed by `episode_key` (season-qualified when the titles carry a
+    season), so a volume disc spanning S04→S05 can't collide E10 with E10.
+    `episode_runtimes` maps that key → real runtime (secs), from the guide; used to
+    spot 'Play All'/omnibus titles by length. Optional: without it a fallback
+    single-episode length is derived from the matched titles' own durations.
+    `guide_keys` is the guide's full ordered key list, which defines adjacency across
+    a season boundary; without it adjacency falls back to the runtime keys.
 
     Returns {"kept": [...], "dropped": [...]}:
     - Unmatched titles (episode is None) → dropped as bonus/compilation.
@@ -604,13 +766,15 @@ def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -
     median_dur = matched_durs[len(matched_durs) // 2] if matched_durs else None
 
     kept, dropped = [], []
-    by_episode: Dict[int, List[Dict]] = {}
+    by_key: Dict[int, List[Dict]] = {}
     for t in identified:
         episode = t.get("episode")
         if episode is None:
             dropped.append({**t, "drop_reason": "no matching episode (bonus/compilation)"})
             continue
-        ref = episode_runtimes.get(episode) or median_dur
+        key = _title_key(t)
+        label = _ep_label(t.get("season"), episode)
+        ref = episode_runtimes.get(key) or median_dur
         dur = t.get("duration_secs")
         if ref and dur and dur > ref * OMNIBUS_RUNTIME_FACTOR:
             dropped.append({**t, "drop_reason":
@@ -619,15 +783,15 @@ def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -
             continue
         # Too SHORT for the episode it matched → a bonus, not the episode. Checked only
         # against the real guide runtime (not median_dur) so it never fires off ripped junk.
-        guide_ref = episode_runtimes.get(episode)
+        guide_ref = episode_runtimes.get(key)
         if guide_ref and dur and dur < guide_ref * SHORT_RUNTIME_FACTOR:
             dropped.append({**t, "drop_reason":
-                            f"too short for E{episode:02d} ({int(dur // 60)} min — "
+                            f"too short for {label} ({int(dur // 60)} min — "
                             f"~{dur / guide_ref:.1f}× episode length; likely a bonus/gag reel)"})
             continue
-        by_episode.setdefault(episode, []).append(t)
+        by_key.setdefault(key, []).append(t)
 
-    for episode, group in sorted(by_episode.items()):
+    for key, group in sorted(by_key.items()):
         if len(group) == 1:
             kept.append(group[0])
             continue
@@ -638,18 +802,20 @@ def reconcile(identified: List[Dict], episode_runtimes: Dict[int, int] = None) -
         # was always a longer compilation — so a short gag reel beat the real episode and
         # the real one was dropped (The Office S2 E20). Needs the guide runtime; with none
         # (legacy path) fall back to shortest-wins.
-        ref = episode_runtimes.get(episode)
+        ref = episode_runtimes.get(key)
         if ref:
             group.sort(key=lambda t: abs(t.get("duration_secs", 0) - ref))
         else:
             group.sort(key=lambda t: t.get("duration_secs", 0))
         kept.append(group[0])
         real_dur = group[0].get("duration_secs", 0)
+        label = _ep_label(group[0].get("season"), group[0]["episode"])
         for dup in group[1:]:
             longer = dup.get("duration_secs", 0) > real_dur
             kind = "longer — 'Play All'" if longer else "shorter — bonus/gag reel"
-            dropped.append({**dup, "drop_reason": f"duplicate of E{episode:02d} ({kind})"})
+            dropped.append({**dup, "drop_reason": f"duplicate of {label} ({kind})"})
 
-    kept = _resolve_isolated_matches(kept, dropped, episode_runtimes)
-    kept.sort(key=lambda t: t["episode"])
+    seq, pos = _key_sequence(episode_runtimes, guide_keys)
+    kept = _resolve_isolated_matches(kept, dropped, episode_runtimes, seq, pos)
+    kept.sort(key=_title_key)
     return {"kept": kept, "dropped": dropped}
